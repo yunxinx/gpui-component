@@ -6285,8 +6285,9 @@ dependencies = [
 
 [[package]]
 name = "psm"
-version = "0.1.30"
-source = "git+https://github.com/rust-lang/stacker?branch=master#100e77fa10a193f3c949af8e7f334c160e1424de"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "645dbe486e346d9b5de3ef16ede18c26e6c70ad97418f4874b8b1889d6e761ea"
 dependencies = [
  "ar_archive_writer",
  "cc",
