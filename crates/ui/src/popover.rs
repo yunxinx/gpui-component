@@ -1,6 +1,6 @@
 use gpui::{
-    Anchor, AnyElement, App, Bounds, Context, Deferred, DismissEvent, Div, ElementId,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
+    Anchor, AnyElement, App, Bounds, Context, Deferred, DismissEvent, Div, ElementId, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent,
     MouseButton, ParentElement, Pixels, Point, Render, RenderOnce, Stateful, StyleRefinement,
     Styled, Subscription, Window, anchored, deferred, div, prelude::FluentBuilder as _, px,
 };
@@ -11,6 +11,13 @@ use crate::{
 };
 
 const CONTEXT: &str = "Popover";
+
+fn is_keyboard_activation(event: &KeyDownEvent) -> bool {
+    !event.is_held
+        && !event.keystroke.modifiers.modified()
+        && (event.keystroke.key.eq("enter") || event.keystroke.key.eq("space"))
+}
+
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("escape", Cancel, Some(CONTEXT))])
 }
@@ -414,6 +421,28 @@ impl RenderOnce for Popover {
                     cx.notify(parent_view_id);
                 }
             })
+            .when(!open, |this| {
+                this.on_key_down({
+                    let state = state.clone();
+                    move |event, window, cx| {
+                        if !is_keyboard_activation(event) {
+                            return;
+                        }
+
+                        if event.keystroke.key.eq("space") {
+                            window.prevent_default();
+                        }
+                        cx.stop_propagation();
+                        state.update(cx, |state, cx| {
+                            // A controlled Popover may still report the previous render's state.
+                            // Normalize it before using the same toggle path as pointer activation.
+                            state.set_open(open, cx);
+                            state.toggle_open(window, cx);
+                        });
+                        cx.notify(parent_view_id);
+                    }
+                })
+            })
             .on_prepaint({
                 let state = state.clone();
                 let position = position.clone();
@@ -473,7 +502,50 @@ impl RenderOnce for Popover {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::MouseButton;
+    use crate::button::Button;
+    use gpui::{
+        AppContext as _, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, VisualTestContext,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    struct KeyboardPopoverTest {
+        content_focus: FocusHandle,
+        open_changes: Rc<RefCell<Vec<bool>>>,
+    }
+
+    impl Render for KeyboardPopoverTest {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let open_changes = self.open_changes.clone();
+            let content_focus = self.content_focus.clone();
+            Popover::new("keyboard-popover")
+                .trigger(Button::new("keyboard-trigger").label("Open"))
+                .track_focus(&self.content_focus)
+                .on_open_change(move |open, _, _| open_changes.borrow_mut().push(*open))
+                .content(move |_, _, _| div().track_focus(&content_focus).child("Content"))
+        }
+    }
+
+    fn draw_and_focus_trigger(cx: &mut VisualTestContext) -> FocusHandle {
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus_next(cx);
+            let focus = window
+                .focused(cx)
+                .expect("popover trigger should be focusable");
+            window.draw(cx).clear(cx);
+            focus
+        })
+    }
+
+    fn key_event(cx: &mut VisualTestContext, key: &str, is_held: bool) {
+        let keystroke = Keystroke::parse(key).expect("valid test keystroke");
+        cx.simulate_event(KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(KeyUpEvent { keystroke });
+    }
 
     #[test]
     fn test_popover_builder_chaining() {
@@ -529,5 +601,47 @@ mod tests {
         let pos = Popover::resolved_corner(Anchor::BottomRight, bounds);
         assert_eq!(pos.x, px(300.));
         assert_eq!(pos.y, px(50.));
+    }
+
+    #[gpui::test]
+    fn keyboard_trigger_opens_once_and_restores_focus(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let content_focus = cx.update(|cx| cx.focus_handle());
+        let open_changes = Rc::new(RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view({
+            let content_focus = content_focus.clone();
+            let open_changes = open_changes.clone();
+            move |window, cx| {
+                let content = cx.new(|_| KeyboardPopoverTest {
+                    content_focus,
+                    open_changes,
+                });
+                crate::Root::new(content, window, cx)
+            }
+        });
+        let trigger_focus = draw_and_focus_trigger(cx);
+
+        key_event(cx, "enter", true);
+        key_event(cx, "cmd-enter", false);
+        assert!(open_changes.borrow().is_empty());
+        cx.update(|window, cx| assert_eq!(window.focused(cx).as_ref(), Some(&trigger_focus)));
+
+        key_event(cx, "enter", false);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(&*open_changes.borrow(), &[true]);
+        cx.update(|window, cx| assert_eq!(window.focused(cx).as_ref(), Some(&content_focus)));
+
+        key_event(cx, "enter", false);
+        assert_eq!(&*open_changes.borrow(), &[true]);
+        cx.update(|window, cx| assert_eq!(window.focused(cx).as_ref(), Some(&content_focus)));
+
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(&*open_changes.borrow(), &[true, false]);
+        cx.update(|window, cx| assert_eq!(window.focused(cx).as_ref(), Some(&trigger_focus)));
+
+        key_event(cx, "space", false);
+        assert_eq!(&*open_changes.borrow(), &[true, false, true]);
+        cx.update(|window, cx| assert_eq!(window.focused(cx).as_ref(), Some(&content_focus)));
     }
 }

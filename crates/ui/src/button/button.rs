@@ -188,6 +188,7 @@ pub struct Button {
     style: StyleRefinement,
     icon: Option<ButtonIcon>,
     label: Option<SharedString>,
+    aria_label: Option<SharedString>,
     children: Vec<AnyElement>,
     disabled: bool,
     pub(crate) selected: bool,
@@ -231,6 +232,7 @@ impl Button {
             style: StyleRefinement::default(),
             icon: None,
             label: None,
+            aria_label: None,
             disabled: false,
             selected: false,
             variant: ButtonVariant::default(),
@@ -285,6 +287,14 @@ impl Button {
     /// Set label to the Button, if no label is set, the button will be in Icon Button mode.
     pub fn label(mut self, label: impl Into<SharedString>) -> Self {
         self.label = Some(label.into());
+        self
+    }
+
+    /// Set the accessible name of the Button independently of its visible label.
+    ///
+    /// If this is not set, the visible label is used as the accessible name.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.aria_label = Some(label.into());
         self
     }
 
@@ -439,8 +449,9 @@ impl RenderOnce for Button {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let style: ButtonVariant = self.variant;
         let clickable = self.clickable();
-        let is_disabled = self.disabled;
+        let is_inert = self.disabled || self.loading;
         let hoverable = self.hoverable();
+        let aria_label = self.aria_label.clone().or_else(|| self.label.clone());
         let normal_style = style.normal(self.outline, cx);
         let icon_size = match self.size {
             Size::Size(v) => Size::Size(v * 0.75),
@@ -468,9 +479,7 @@ impl RenderOnce for Button {
             } else {
                 Role::Button
             })
-            .when_some(self.label.as_ref(), |this, label| {
-                this.aria_label(label.clone())
-            })
+            .when_some(aria_label, |this, label| this.aria_label(label))
             .aria_selected(self.selected)
             .when(!self.disabled, |this| {
                 this.track_focus(
@@ -572,9 +581,9 @@ impl RenderOnce for Button {
             })
             .refine_style(&self.style)
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                // Stop handle any click event when disabled.
-                // To avoid handle dropdown menu open when button is disabled.
-                if is_disabled {
+                // Keep disabled and loading buttons inert even when an ancestor handles
+                // pointer activation, such as a Popover trigger wrapper.
+                if is_inert {
                     cx.stop_propagation();
                     return;
                 }
@@ -584,6 +593,22 @@ impl RenderOnce for Button {
 
                 // Pressing a button must not start the window-level text selection.
                 crate::global_state::GlobalState::suppress_text_selection(cx);
+            })
+            .when(is_inert, |this| {
+                this.on_key_down(|event, window, cx| {
+                    let keystroke = &event.keystroke;
+                    let is_activation_key = (keystroke.key.eq("enter")
+                        || keystroke.key.eq("space"))
+                        && !keystroke.modifiers.modified();
+                    if !is_activation_key {
+                        return;
+                    }
+
+                    if keystroke.key.eq("space") {
+                        window.prevent_default();
+                    }
+                    cx.stop_propagation();
+                })
             })
             .when_some(self.on_click, |this, on_click| {
                 this.on_click(move |event, window, cx| {
@@ -1149,12 +1174,82 @@ impl ButtonVariant {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{linear_color_stop, linear_gradient};
+    use gpui::{
+        Context, Element as _, FocusHandle, KeyDownEvent, KeyUpEvent, Keystroke, Render,
+        VisualTestContext, linear_color_stop, linear_gradient,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    struct AccessibleIconButton;
+
+    impl Render for AccessibleIconButton {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let element = Button::new("search")
+                .icon(crate::IconName::Search)
+                .aria_label("Search conversations")
+                .render(window, cx)
+                .into_element();
+            let role = element
+                .a11y_role()
+                .expect("button must expose an ARIA role");
+            let mut node = gpui::accesskit::Node::new(role);
+
+            element.write_a11y_info(&mut node);
+
+            assert_eq!(role, gpui::accesskit::Role::Button);
+            assert_eq!(node.label(), Some("Search conversations"));
+            element.into_any()
+        }
+    }
+
+    struct ButtonActivationTest {
+        clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for ButtonActivationTest {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let clicks = self.clicks.clone();
+            div()
+                .child(
+                    Button::new("activation")
+                        .label("Activate")
+                        .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+                )
+                .child(Button::new("other").label("Other"))
+        }
+    }
+
+    fn draw_and_focus_first(cx: &mut VisualTestContext) -> FocusHandle {
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus_next(cx);
+            let focus = window
+                .focused(cx)
+                .expect("first button should be focusable");
+            window.draw(cx).clear(cx);
+            focus
+        })
+    }
+
+    fn key_down(cx: &mut VisualTestContext, key: &str) {
+        cx.simulate_event(KeyDownEvent {
+            keystroke: Keystroke::parse(key).expect("valid test keystroke"),
+            is_held: false,
+            prefer_character_input: false,
+        });
+    }
+
+    fn key_up(cx: &mut VisualTestContext, key: &str) {
+        cx.simulate_event(KeyUpEvent {
+            keystroke: Keystroke::parse(key).expect("valid test keystroke"),
+        });
+    }
 
     #[gpui::test]
     fn test_button_builder(_cx: &mut gpui::TestAppContext) {
         let button = Button::new("complex-button")
             .label("Save Changes")
+            .aria_label("Save document changes")
             .primary()
             .outline()
             .large()
@@ -1170,6 +1265,7 @@ mod tests {
             .on_click(|_, _, _| {});
 
         assert_eq!(button.label, Some("Save Changes".into()));
+        assert_eq!(button.aria_label, Some("Save document changes".into()));
         assert_eq!(button.variant, ButtonVariant::Primary);
         assert!(button.outline);
         assert_eq!(button.size, Size::Large);
@@ -1182,6 +1278,45 @@ mod tests {
         assert!(button.tab_stop);
         assert!(!button.dropdown_caret);
         assert!(matches!(button.rounded, ButtonRounded::Medium));
+    }
+
+    #[gpui::test]
+    fn icon_button_writes_explicit_accessible_name(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let (_, cx) = cx.add_window_view(|_, _| AccessibleIconButton);
+
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn keyboard_activation_uses_gpui_click_pairing(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let clicks = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let clicks = clicks.clone();
+            move |_, _| ButtonActivationTest { clicks }
+        });
+        let trigger_focus = draw_and_focus_first(cx);
+
+        key_down(cx, "enter");
+        key_up(cx, "enter");
+        key_down(cx, "space");
+        key_up(cx, "space");
+        key_down(cx, "cmd-enter");
+        key_up(cx, "cmd-enter");
+        assert_eq!(clicks.get(), 2);
+
+        key_down(cx, "enter");
+        cx.update(|window, cx| {
+            window.focus_next(cx);
+            window.draw(cx).clear(cx);
+        });
+        key_up(cx, "enter");
+
+        assert_eq!(clicks.get(), 2);
+        cx.update(|window, cx| assert_ne!(window.focused(cx).as_ref(), Some(&trigger_focus)));
     }
 
     #[gpui::test]
