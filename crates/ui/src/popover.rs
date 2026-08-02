@@ -12,9 +12,8 @@ use crate::{
 
 const CONTEXT: &str = "Popover";
 
-fn is_keyboard_activation(event: &KeyDownEvent) -> bool {
-    !event.is_held
-        && !event.keystroke.modifiers.modified()
+fn is_keyboard_activation_key(event: &KeyDownEvent) -> bool {
+    !event.keystroke.modifiers.modified()
         && (event.keystroke.key.eq("enter") || event.keystroke.key.eq("space"))
 }
 
@@ -425,7 +424,7 @@ impl RenderOnce for Popover {
                 this.on_key_down({
                     let state = state.clone();
                     move |event, window, cx| {
-                        if !is_keyboard_activation(event) {
+                        if !is_keyboard_activation_key(event) {
                             return;
                         }
 
@@ -433,6 +432,9 @@ impl RenderOnce for Popover {
                             window.prevent_default();
                         }
                         cx.stop_propagation();
+                        if event.is_held {
+                            return;
+                        }
                         state.update(cx, |state, cx| {
                             // A controlled Popover may still report the previous render's state.
                             // Normalize it before using the same toggle path as pointer activation.
@@ -506,22 +508,35 @@ mod tests {
     use gpui::{
         AppContext as _, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, VisualTestContext,
     };
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     struct KeyboardPopoverTest {
         content_focus: FocusHandle,
         open_changes: Rc<RefCell<Vec<bool>>>,
+        held_space_bubbles: Rc<Cell<usize>>,
     }
 
     impl Render for KeyboardPopoverTest {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let open_changes = self.open_changes.clone();
             let content_focus = self.content_focus.clone();
-            Popover::new("keyboard-popover")
-                .trigger(Button::new("keyboard-trigger").label("Open"))
-                .track_focus(&self.content_focus)
-                .on_open_change(move |open, _, _| open_changes.borrow_mut().push(*open))
-                .content(move |_, _, _| div().track_focus(&content_focus).child("Content"))
+            let held_space_bubbles = self.held_space_bubbles.clone();
+            div()
+                .on_key_down(move |event, _, _| {
+                    if event.is_held && event.keystroke.key.eq("space") {
+                        held_space_bubbles.set(held_space_bubbles.get() + 1);
+                    }
+                })
+                .child(
+                    Popover::new("keyboard-popover")
+                        .trigger(Button::new("keyboard-trigger").label("Open"))
+                        .track_focus(&self.content_focus)
+                        .on_open_change(move |open, _, _| open_changes.borrow_mut().push(*open))
+                        .content(move |_, _, _| div().track_focus(&content_focus).child("Content")),
+                )
         }
     }
 
@@ -608,13 +623,16 @@ mod tests {
         cx.update(crate::init);
         let content_focus = cx.update(|cx| cx.focus_handle());
         let open_changes = Rc::new(RefCell::new(Vec::new()));
+        let held_space_bubbles = Rc::new(Cell::new(0));
         let (_, cx) = cx.add_window_view({
             let content_focus = content_focus.clone();
             let open_changes = open_changes.clone();
+            let held_space_bubbles = held_space_bubbles.clone();
             move |window, cx| {
                 let content = cx.new(|_| KeyboardPopoverTest {
                     content_focus,
                     open_changes,
+                    held_space_bubbles,
                 });
                 crate::Root::new(content, window, cx)
             }
@@ -622,8 +640,14 @@ mod tests {
         let trigger_focus = draw_and_focus_trigger(cx);
 
         key_event(cx, "enter", true);
+        key_event(cx, "space", true);
         key_event(cx, "cmd-enter", false);
         assert!(open_changes.borrow().is_empty());
+        assert_eq!(
+            held_space_bubbles.get(),
+            0,
+            "held Space must remain consumed by the closed trigger"
+        );
         cx.update(|window, cx| assert_eq!(window.focused(cx).as_ref(), Some(&trigger_focus)));
 
         key_event(cx, "enter", false);
