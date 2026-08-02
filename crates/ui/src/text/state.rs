@@ -637,31 +637,140 @@ fn merge_pending_options(options: &mut UpdateOptions, rx: &Receiver<UpdateOption
     true
 }
 
+fn parse_full_replacement(
+    format: TextViewFormat,
+    source: String,
+    options: &UpdateOptions,
+) -> Result<ParsedContent, SharedString> {
+    parse_content(
+        format,
+        ParsedContent::default(),
+        &UpdateOptions {
+            revision: options.revision,
+            pending_text: source,
+            append: false,
+            markdown_extensions: options.markdown_extensions.clone(),
+            publish_result: options.publish_result,
+        },
+    )
+}
+
+fn parse_appended_full_replacement(
+    format: TextViewFormat,
+    content: &ParsedContent,
+    options: &UpdateOptions,
+) -> Result<ParsedContent, SharedString> {
+    let mut full_source =
+        String::with_capacity(content.document.source.len() + options.pending_text.len());
+    full_source.push_str(&content.document.source);
+    full_source.push_str(&options.pending_text);
+    parse_full_replacement(format, full_source, options)
+}
+
 fn parse_content(
     format: TextViewFormat,
     mut content: ParsedContent,
     options: &UpdateOptions,
 ) -> Result<ParsedContent, SharedString> {
+    let previous_reference_identifiers = options
+        .append
+        .then(|| {
+            content
+                .node_cx
+                .link_refs
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let previous_footnote_identifiers = options
+        .append
+        .then(|| content.node_cx.footnote_definition_identifiers())
+        .unwrap_or_default();
+    let link_refs = if options.append {
+        std::mem::take(&mut content.node_cx.link_refs)
+    } else {
+        Default::default()
+    };
+    let link_ref_source_identifiers = if options.append {
+        std::mem::take(&mut content.node_cx.link_ref_source_identifiers)
+    } else {
+        Default::default()
+    };
     let mut node_cx = NodeContext {
+        link_refs,
+        link_ref_source_identifiers,
         markdown_extensions: options.markdown_extensions.clone(),
         ..NodeContext::default()
     };
-
-    let mut source = String::new();
-    if options.append
-        && let Some(last_block) = content.document.blocks.pop()
-        && let Some(span) = last_block.span()
-    {
-        node_cx.offset = span.start;
-        let last_source = &content.document.source[span.start..];
-        source.push_str(last_source);
-        source.push_str(&options.pending_text);
-    } else {
-        source = options.pending_text.to_string();
+    if options.append {
+        node_cx.take_definition_metadata_from(&mut content.node_cx);
     }
 
+    let mut source = String::new();
+    if options.append {
+        if let Some(last_block) = content.document.blocks.pop() {
+            // The last block is reparsed below. Remove any definitions it
+            // contributed so invalidated or renamed definitions cannot linger.
+            if let Some(span) = last_block.span() {
+                if !node_cx.retain_definitions_before(span.start) {
+                    return parse_appended_full_replacement(format, &content, options);
+                }
+                node_cx.offset = span.start;
+                let last_source = &content.document.source[span.start..];
+                source.push_str(last_source);
+                source.push_str(&options.pending_text);
+            } else {
+                source.push_str(&options.pending_text);
+            }
+        } else {
+            source.push_str(&options.pending_text);
+        }
+    } else {
+        source.push_str(&options.pending_text);
+    }
+
+    // A rare definition may have no equivalent label that can be replayed
+    // outside its original container. Preserve correctness by parsing the real
+    // full source instead of constructing an incomplete reference prefix.
+    if options.append && node_cx.link_ref_source_identifiers.len() != node_cx.link_refs.len() {
+        return parse_appended_full_replacement(format, &content, options);
+    }
+
+    // markdown-rs resolves links and footnotes while building the AST, so the
+    // fragment parser must also know definitions retained in earlier blocks.
+    let retained_reference_source_identifiers = options
+        .append
+        .then(|| {
+            node_cx
+                .link_ref_source_identifiers
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let retained_footnote_source_identifiers = if options.append {
+        let Some(identifiers) = node_cx.footnote_source_identifiers() else {
+            return parse_appended_full_replacement(format, &content, options);
+        };
+        identifiers
+    } else {
+        Vec::new()
+    };
+
     let new_document = match format {
-        TextViewFormat::Markdown => format::markdown::parse(&source, &mut node_cx),
+        TextViewFormat::Markdown
+            if retained_reference_source_identifiers.is_empty()
+                && retained_footnote_source_identifiers.is_empty() =>
+        {
+            format::markdown::parse(&source, &mut node_cx)
+        }
+        TextViewFormat::Markdown => format::markdown::parse_with_retained_definitions(
+            &source,
+            &retained_reference_source_identifiers,
+            &retained_footnote_source_identifiers,
+            &mut node_cx,
+        ),
         TextViewFormat::Html => format::html::parse(&source, &mut node_cx),
     }?;
 
@@ -673,6 +782,21 @@ fn parse_content(
         content.document = new_document;
     }
 
+    let reference_identifiers_changed = previous_reference_identifiers.len()
+        != node_cx.link_refs.len()
+        || previous_reference_identifiers
+            .iter()
+            .any(|identifier| !node_cx.link_refs.contains_key(identifier));
+    let footnote_identifiers_changed =
+        previous_footnote_identifiers != node_cx.footnote_definition_identifiers();
+    // Retained blocks may contain literal references or resolved reference
+    // nodes depending on the global definition sets. Reparse the whole
+    // document only when either set changes; URL/title-only edits keep state.
+    if options.append && (reference_identifiers_changed || footnote_identifiers_changed) {
+        return parse_full_replacement(format, content.document.source.to_string(), options);
+    }
+    content.node_cx = node_cx;
+
     Ok(content)
 }
 
@@ -681,6 +805,536 @@ mod tests {
     use super::*;
     use crate::text::MarkdownNode;
     use gpui::TestAppContext;
+
+    fn parse_markdown(content: ParsedContent, source: &str, append: bool) -> ParsedContent {
+        parse_markdown_with_extensions(content, source, append, Arc::default())
+    }
+
+    fn parse_markdown_with_extensions(
+        content: ParsedContent,
+        source: &str,
+        append: bool,
+        markdown_extensions: Arc<MarkdownExtensions>,
+    ) -> ParsedContent {
+        parse_content(
+            TextViewFormat::Markdown,
+            content,
+            &UpdateOptions {
+                revision: 1,
+                pending_text: source.to_string(),
+                append,
+                markdown_extensions,
+                publish_result: true,
+            },
+        )
+        .expect("test markdown should parse")
+    }
+
+    fn paragraph_has_reference(content: &ParsedContent, block_ix: usize, identifier: &str) -> bool {
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[block_ix] else {
+            panic!("expected paragraph at block {block_ix}");
+        };
+        paragraph_contains_reference(paragraph, identifier)
+    }
+
+    fn paragraph_contains_reference(paragraph: &node::Paragraph, identifier: &str) -> bool {
+        paragraph.children.iter().any(|child| {
+            child.marks.iter().any(|(_, mark)| {
+                mark.link
+                    .as_ref()
+                    .and_then(|link| link.identifier.as_deref())
+                    == Some(identifier)
+            })
+        })
+    }
+
+    fn block_contains_reference(block: &node::BlockNode, identifier: &str) -> bool {
+        match block {
+            node::BlockNode::Paragraph(paragraph) => {
+                paragraph_contains_reference(paragraph, identifier)
+            }
+            node::BlockNode::Root { children, .. }
+            | node::BlockNode::Blockquote { children, .. }
+            | node::BlockNode::List { children, .. }
+            | node::BlockNode::ListItem { children, .. } => children
+                .iter()
+                .any(|child| block_contains_reference(child, identifier)),
+            _ => false,
+        }
+    }
+
+    fn paragraph_has_footnote_reference(
+        content: &ParsedContent,
+        block_ix: usize,
+        identifier: &str,
+    ) -> bool {
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[block_ix] else {
+            panic!("expected paragraph at block {block_ix}");
+        };
+        let expected = format!("[{identifier}]");
+        paragraph.children.iter().any(|child| {
+            child.text.as_ref() == expected.as_str()
+                && child.marks.iter().any(|(_, mark)| mark.italic)
+        })
+    }
+
+    #[test]
+    fn replacement_synchronizes_markdown_reference_definitions() {
+        let content = parse_markdown(
+            ParsedContent::default(),
+            "[value][ref]\n\n[ref]: https://example.com/reference \"Reference title\"",
+            false,
+        );
+
+        let reference = content
+            .node_cx
+            .link_refs
+            .get("ref")
+            .expect("reference definition should remain available for rendering");
+        assert_eq!(reference.url.as_ref(), "https://example.com/reference");
+        assert_eq!(reference.title.as_deref(), Some("Reference title"));
+
+        let content = parse_markdown(content, "[ref]: https://example.com/replaced", false);
+        assert_eq!(
+            content.node_cx.link_refs["ref"].url.as_ref(),
+            "https://example.com/replaced"
+        );
+
+        let content = parse_markdown(content, "plain text without a definition", false);
+        assert!(content.node_cx.link_refs.is_empty());
+
+        let content = parse_markdown(
+            content,
+            "[ref]: https://example.com/first\n[ref]: https://example.com/ignored\n\n[value][ref]",
+            false,
+        );
+        assert_eq!(
+            content.node_cx.link_refs["ref"].url.as_ref(),
+            "https://example.com/first",
+            "Markdown keeps the first duplicate definition"
+        );
+    }
+
+    #[test]
+    fn append_synchronizes_markdown_reference_definitions() {
+        let content = parse_markdown(
+            ParsedContent::default(),
+            "[value][late]\n\ntrailing block",
+            false,
+        );
+        assert!(!paragraph_has_reference(&content, 0, "late"));
+        let content = parse_markdown(content, "\n\n[late]: https://example.com/late", true);
+        assert!(
+            paragraph_has_reference(&content, 0, "late"),
+            "adding a definition must reparse references in retained blocks"
+        );
+
+        let content = parse_markdown(
+            ParsedContent::default(),
+            "> [ref]: https://example.com/original\n\n[value][ref]",
+            false,
+        );
+        assert!(paragraph_has_reference(&content, 1, "ref"));
+        let content = parse_markdown(content, " tail", true);
+        assert_eq!(
+            content.node_cx.link_refs["ref"].url.as_ref(),
+            "https://example.com/original"
+        );
+        assert!(
+            paragraph_has_reference(&content, 1, "ref"),
+            "reparsing a reference must retain definitions from earlier blocks"
+        );
+
+        let content = parse_markdown(
+            ParsedContent::default(),
+            "> [a\\]b]: https://example.com/escaped\n\n[value][a\\]b]",
+            false,
+        );
+        let escaped_identifier = content
+            .node_cx
+            .link_refs
+            .keys()
+            .next()
+            .expect("escaped reference definition should parse")
+            .clone();
+        assert!(paragraph_has_reference(&content, 1, &escaped_identifier));
+        let content = parse_markdown(content, " tail", true);
+        assert!(
+            paragraph_has_reference(&content, 1, &escaped_identifier),
+            "synthetic definitions must preserve normalized escaped identifiers"
+        );
+
+        let content = parse_markdown(content, "\n\n[other]: https://example.com/appended", true);
+        assert_eq!(
+            content.node_cx.link_refs["other"].url.as_ref(),
+            "https://example.com/appended"
+        );
+
+        let content = parse_markdown(
+            ParsedContent::default(),
+            "[value][stable]\n\ntrailing block\n\n[stable]: https://example.com/old",
+            false,
+        );
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained reference paragraph");
+        };
+        let retained_state = paragraph.state.clone();
+        let content = parse_markdown(content, "er", true);
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained reference paragraph after URL append");
+        };
+        assert!(
+            Arc::ptr_eq(&retained_state, &paragraph.state),
+            "changing only a definition URL should keep retained paragraph state"
+        );
+        assert_eq!(
+            content.node_cx.link_refs["stable"].url.as_ref(),
+            "https://example.com/older"
+        );
+
+        let content = parse_markdown(
+            ParsedContent::default(),
+            "[value][ref]\n\ntrailing block\n\n> [ref]: https://example.com/original",
+            false,
+        );
+        assert!(paragraph_has_reference(&content, 0, "ref"));
+        let content = parse_markdown(content, " \"unterminated title", true);
+        assert!(
+            !content.node_cx.link_refs.contains_key("ref"),
+            "a reference that no longer has a valid definition must not retain its old URL"
+        );
+        assert!(
+            !paragraph_has_reference(&content, 0, "ref"),
+            "invalidating a definition must reparse references in retained blocks"
+        );
+    }
+
+    #[test]
+    fn append_retains_the_reparseable_reference_source_identifier() {
+        // Unicode case normalization expands each U+0130 into multiple code
+        // points. The normalized key no longer fits markdown-rs's definition
+        // label limit even though the original, valid source label does.
+        let source_identifier = "İ".repeat(499);
+        let source = format!(
+            "[{source_identifier}]: https://example.com/unicode\n\n[value][{source_identifier}]"
+        );
+        let content = parse_markdown(ParsedContent::default(), &source, false);
+        let normalized_identifier = content
+            .node_cx
+            .link_refs
+            .keys()
+            .next()
+            .expect("Unicode reference definition should parse")
+            .clone();
+        assert_ne!(normalized_identifier.as_ref(), source_identifier);
+        assert_eq!(
+            content
+                .node_cx
+                .link_ref_source_identifiers
+                .get(&normalized_identifier)
+                .map(|identifier| identifier.as_ref()),
+            Some(source_identifier.as_str())
+        );
+        assert!(paragraph_has_reference(&content, 1, &normalized_identifier));
+
+        let content = parse_markdown(content, " tail", true);
+        assert!(
+            paragraph_has_reference(&content, 1, &normalized_identifier),
+            "append must use the valid source label instead of the expanded normalized key"
+        );
+        assert_eq!(
+            content.node_cx.link_refs[&normalized_identifier]
+                .url
+                .as_ref(),
+            "https://example.com/unicode"
+        );
+    }
+
+    #[test]
+    fn append_replays_multiline_definitions_outside_their_container() {
+        let content = parse_markdown(
+            ParsedContent::default(),
+            "> [foo\n> bar]: https://example.com/container\n\n> [value][foo\n> bar]",
+            false,
+        );
+        let normalized_identifier = content
+            .node_cx
+            .link_refs
+            .keys()
+            .next()
+            .expect("container reference definition should parse")
+            .clone();
+        assert_eq!(normalized_identifier.as_ref(), "foo> bar");
+        assert!(block_contains_reference(
+            &content.document.blocks[1],
+            &normalized_identifier
+        ));
+
+        let content = parse_markdown(content, " tail", true);
+        assert!(
+            block_contains_reference(&content.document.blocks[1], &normalized_identifier),
+            "container continuation markers must not invalidate the retained prefix"
+        );
+        assert_eq!(
+            content.node_cx.link_refs[&normalized_identifier]
+                .url
+                .as_ref(),
+            "https://example.com/container"
+        );
+    }
+
+    #[test]
+    fn append_falls_back_when_a_reference_identifier_cannot_be_replayed() {
+        let mut content = parse_markdown(
+            ParsedContent::default(),
+            "[ref]: https://example.com/fallback\n\n[value][ref]",
+            false,
+        );
+        content.node_cx.link_ref_source_identifiers.clear();
+
+        let content = parse_markdown(content, " tail", true);
+        assert_eq!(
+            content.document.source.as_ref(),
+            "[ref]: https://example.com/fallback\n\n[value][ref] tail"
+        );
+        assert!(paragraph_has_reference(&content, 1, "ref"));
+        assert_eq!(
+            content.node_cx.link_refs["ref"].url.as_ref(),
+            "https://example.com/fallback"
+        );
+    }
+
+    #[test]
+    fn append_preserves_gfm_footnote_definition_context() {
+        let content = parse_markdown(
+            ParsedContent::default(),
+            "retained paragraph\n\n[^n]: note\n\ntrailing",
+            false,
+        );
+        assert!(content.node_cx.has_footnote_definition("n"));
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained paragraph");
+        };
+        let retained_state = paragraph.state.clone();
+        let content = parse_markdown(content, " [^n]", true);
+        assert!(
+            paragraph_has_footnote_reference(&content, 2, "n"),
+            "a retained definition must resolve a newly appended footnote reference"
+        );
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained paragraph after append");
+        };
+        assert!(
+            Arc::ptr_eq(&retained_state, &paragraph.state),
+            "retained footnote context must not rebuild unrelated paragraph state"
+        );
+
+        let content = parse_markdown(
+            ParsedContent::default(),
+            "before [^late]\n\ntrailing",
+            false,
+        );
+        assert!(!paragraph_has_footnote_reference(&content, 0, "late"));
+        let content = parse_markdown(content, "\n\n[^late]: note", true);
+        assert!(
+            paragraph_has_footnote_reference(&content, 0, "late"),
+            "a new definition must reparse retained literal footnote references"
+        );
+    }
+
+    #[test]
+    fn append_collects_footnote_definitions_before_custom_block_parsers() {
+        let direct_extensions = Arc::new(MarkdownExtensions::default().block_parser(|node, _| {
+            matches!(node, markdown::mdast::Node::FootnoteDefinition(_))
+                .then(|| MarkdownNode::new("custom-footnote", ()))
+        }));
+        let content = parse_markdown_with_extensions(
+            ParsedContent::default(),
+            "[^direct]: note\n\ntrailing",
+            false,
+            direct_extensions.clone(),
+        );
+        assert!(content.node_cx.has_footnote_definition("direct"));
+        let content =
+            parse_markdown_with_extensions(content, " [^direct]", true, direct_extensions);
+        assert!(paragraph_has_footnote_reference(&content, 1, "direct"));
+
+        let container_extensions =
+            Arc::new(MarkdownExtensions::default().block_parser(|node, _| {
+                matches!(node, markdown::mdast::Node::Blockquote(_))
+                    .then(|| MarkdownNode::new("custom-footnote-container", ()))
+            }));
+        let content = parse_markdown_with_extensions(
+            ParsedContent::default(),
+            "> [^nested]: note\n\ntrailing",
+            false,
+            container_extensions.clone(),
+        );
+        assert!(content.node_cx.has_footnote_definition("nested"));
+        let content =
+            parse_markdown_with_extensions(content, " [^nested]", true, container_extensions);
+        assert!(paragraph_has_footnote_reference(&content, 1, "nested"));
+    }
+
+    #[test]
+    fn append_collects_link_definitions_before_custom_block_parsers() {
+        let direct_extensions = Arc::new(MarkdownExtensions::default().block_parser(|node, _| {
+            matches!(node, markdown::mdast::Node::Definition(_))
+                .then(|| MarkdownNode::new("custom-link-definition", ()))
+        }));
+        let content = parse_markdown_with_extensions(
+            ParsedContent::default(),
+            "[direct]: https://example.com/direct\n\ntrailing",
+            false,
+            direct_extensions.clone(),
+        );
+        assert_eq!(
+            content.node_cx.link_refs["direct"].url.as_ref(),
+            "https://example.com/direct"
+        );
+        let content = parse_markdown_with_extensions(
+            content,
+            " [value][direct]",
+            true,
+            direct_extensions.clone(),
+        );
+        assert!(paragraph_has_reference(&content, 1, "direct"));
+
+        let content = parse_markdown_with_extensions(
+            ParsedContent::default(),
+            "[value][stable]\n\n[stable]: https://example.com/old",
+            false,
+            direct_extensions.clone(),
+        );
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained link paragraph");
+        };
+        let retained_state = paragraph.state.clone();
+        let content =
+            parse_markdown_with_extensions(content, "er", true, direct_extensions.clone());
+        assert_eq!(
+            content.node_cx.link_refs["stable"].url.as_ref(),
+            "https://example.com/older"
+        );
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained link paragraph after URL append");
+        };
+        assert!(Arc::ptr_eq(&retained_state, &paragraph.state));
+        let content = parse_markdown_with_extensions(
+            content,
+            " \"unterminated title",
+            true,
+            direct_extensions,
+        );
+        assert!(!content.node_cx.link_refs.contains_key("stable"));
+        assert!(!paragraph_has_reference(&content, 0, "stable"));
+
+        let container_extensions =
+            Arc::new(MarkdownExtensions::default().block_parser(|node, _| {
+                matches!(node, markdown::mdast::Node::Blockquote(_))
+                    .then(|| MarkdownNode::new("custom-link-container", ()))
+            }));
+        let content = parse_markdown_with_extensions(
+            ParsedContent::default(),
+            "> [nested]: https://example.com/nested\n\ntrailing",
+            false,
+            container_extensions.clone(),
+        );
+        assert_eq!(
+            content.node_cx.link_refs["nested"].url.as_ref(),
+            "https://example.com/nested"
+        );
+        let content = parse_markdown_with_extensions(
+            content,
+            " [value][nested]",
+            true,
+            container_extensions.clone(),
+        );
+        assert!(paragraph_has_reference(&content, 1, "nested"));
+
+        let content = parse_markdown_with_extensions(
+            ParsedContent::default(),
+            "[value][nested]\n\n> [nested]: https://example.com/old",
+            false,
+            container_extensions.clone(),
+        );
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained nested link paragraph");
+        };
+        let retained_state = paragraph.state.clone();
+        let content = parse_markdown_with_extensions(content, "er", true, container_extensions);
+        assert_eq!(
+            content.node_cx.link_refs["nested"].url.as_ref(),
+            "https://example.com/older"
+        );
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained nested link paragraph after URL append");
+        };
+        assert!(Arc::ptr_eq(&retained_state, &paragraph.state));
+    }
+
+    #[test]
+    fn append_retains_reparseable_footnote_source_identifiers() {
+        for source_identifier in ["a\\]b".to_string(), "İ".repeat(499)] {
+            let source = format!("retained paragraph\n\n[^{source_identifier}]: note\n\ntrailing");
+            let content = parse_markdown(ParsedContent::default(), &source, false);
+            let normalized_identifier = content
+                .node_cx
+                .footnote_definition_identifiers()
+                .into_iter()
+                .next()
+                .expect("footnote definition should parse");
+            let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+                panic!("expected retained paragraph");
+            };
+            let retained_state = paragraph.state.clone();
+
+            let content = parse_markdown(content, &format!(" [^{source_identifier}]"), true);
+            assert!(paragraph_has_footnote_reference(
+                &content,
+                2,
+                &normalized_identifier
+            ));
+            let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+                panic!("expected retained paragraph after append");
+            };
+            assert!(
+                Arc::ptr_eq(&retained_state, &paragraph.state),
+                "footnote source identifier {source_identifier:?} should be replayed incrementally"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_footnote_prefix_keeps_indented_code_at_document_root() {
+        for indentation in ["    ", "\t"] {
+            let source = format!(
+                "retained paragraph\n\n[^n]: note\n\nseparator paragraph\n\n{indentation}code"
+            );
+            let expected_source = format!("{source} more");
+            let expected = parse_markdown(ParsedContent::default(), &expected_source, false);
+            let content = parse_markdown(ParsedContent::default(), &source, false);
+            let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+                panic!("expected retained paragraph");
+            };
+            let retained_state = paragraph.state.clone();
+
+            let content = parse_markdown(content, " more", true);
+            assert_eq!(content.document.source.as_ref(), expected_source);
+            let node::BlockNode::CodeBlock(actual_code) = &content.document.blocks[3] else {
+                panic!("expected appended indented code block");
+            };
+            let node::BlockNode::CodeBlock(expected_code) = &expected.document.blocks[3] else {
+                panic!("expected baseline indented code block");
+            };
+            assert_eq!(actual_code.code(), expected_code.code());
+            assert_eq!(actual_code.span, expected_code.span);
+            let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+                panic!("expected retained paragraph after append");
+            };
+            assert!(Arc::ptr_eq(&retained_state, &paragraph.state));
+        }
+    }
 
     #[gpui::test]
     fn set_text_then_push_str_appends_to_replaced_content(cx: &mut TestAppContext) {

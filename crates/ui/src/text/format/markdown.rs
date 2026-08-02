@@ -12,13 +12,236 @@ use crate::text::{
     },
 };
 
+const DEFINITION_BOUNDARY: &str = "gpui-component-retained-definition-boundary";
+
 /// Parse Markdown into a tree of nodes.
 pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument, SharedString> {
+    parse_with_retained_definitions(source, &[], &[], cx)
+}
+
+/// Parse an incremental fragment with reference identifiers retained from
+/// earlier blocks in the same document.
+#[cfg(test)]
+pub(crate) fn parse_with_reference_identifiers(
+    source: &str,
+    reference_source_identifiers: &[SharedString],
+    cx: &mut NodeContext,
+) -> Result<ParsedDocument, SharedString> {
+    parse_with_retained_definitions(source, reference_source_identifiers, &[], cx)
+}
+
+/// Parse an incremental fragment with document-wide definitions retained from
+/// earlier blocks in the same document.
+pub(crate) fn parse_with_retained_definitions(
+    source: &str,
+    reference_source_identifiers: &[SharedString],
+    footnote_source_identifiers: &[SharedString],
+    cx: &mut NodeContext,
+) -> Result<ParsedDocument, SharedString> {
     let prepared_source = cx.markdown_extensions.prepared_source(source)?;
     let options = cx.markdown_extensions.configured_parse_options();
-    markdown::to_mdast(&prepared_source, &options)
-        .map(|n| ast_to_document(source, &prepared_source, n, cx))
-        .map_err(|e| e.to_string().into())
+    let Some((parse_source, prefix_len, prefix_line_count)) = definition_prefix(
+        &prepared_source,
+        reference_source_identifiers,
+        footnote_source_identifiers,
+    ) else {
+        return markdown::to_mdast(&prepared_source, &options)
+            .map(|root| ast_to_document(source, &prepared_source, root, &options, cx))
+            .map_err(|error| error.to_string().into());
+    };
+
+    let mut root = match markdown::to_mdast(&parse_source, &options) {
+        Ok(root) => root,
+        Err(prefix_error) => {
+            return match markdown::to_mdast(&prepared_source, &options) {
+                Err(source_error) => Err(source_error.to_string().into()),
+                Ok(_) => Err(format!(
+                    "failed to parse Markdown with retained definitions: {}",
+                    prefix_error.reason
+                )
+                .into()),
+            };
+        }
+    };
+    remove_definition_prefix(
+        &mut root,
+        reference_source_identifiers.len(),
+        footnote_source_identifiers.len(),
+        prefix_len,
+        prefix_line_count,
+    )?;
+    Ok(ast_to_document(
+        source,
+        &prepared_source,
+        root,
+        &options,
+        cx,
+    ))
+}
+
+/// Prefix an incremental fragment with inert definitions so markdown-rs knows
+/// which retained identifiers are valid while parsing the fragment.
+///
+/// Definitions are placed before the fragment because an unterminated fenced
+/// code, HTML, or math block at EOF could consume a suffix. These are the
+/// original, reparseable source identifiers captured from definition nodes,
+/// before markdown-rs performs potentially length-expanding Unicode case
+/// normalization.
+fn definition_prefix(
+    prepared_source: &str,
+    reference_source_identifiers: &[SharedString],
+    footnote_source_identifiers: &[SharedString],
+) -> Option<(String, usize, usize)> {
+    if reference_source_identifiers.is_empty() && footnote_source_identifiers.is_empty() {
+        return None;
+    }
+
+    let mut parse_source = String::new();
+    for identifier in reference_source_identifiers {
+        parse_source.push('[');
+        parse_source.push_str(identifier);
+        parse_source.push_str("]: /\n");
+    }
+    for identifier in footnote_source_identifiers {
+        parse_source.push_str("[^");
+        parse_source.push_str(identifier);
+        parse_source.push_str("]: /\n");
+    }
+    parse_source.push('\n');
+    parse_source.push_str(DEFINITION_BOUNDARY);
+    parse_source.push_str("\n\n");
+
+    let prefix_len = parse_source.len();
+    let prefix_line_count = markdown_line_ending_count(&parse_source);
+    parse_source.push_str(prepared_source);
+    Some((parse_source, prefix_len, prefix_line_count))
+}
+
+fn markdown_line_ending_count(source: &str) -> usize {
+    let bytes = source.as_bytes();
+    let mut count = 0;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            b'\r' => {
+                count += 1;
+                offset += usize::from(bytes.get(offset + 1) == Some(&b'\n')) + 1;
+            }
+            b'\n' => {
+                count += 1;
+                offset += 1;
+            }
+            _ => offset += 1,
+        }
+    }
+    count
+}
+
+/// Remove the synthetic definitions and translate all remaining mdast source
+/// positions back into the fragment's coordinate space.
+fn remove_definition_prefix(
+    root: &mut Node,
+    reference_definition_count: usize,
+    footnote_definition_count: usize,
+    prefix_len: usize,
+    prefix_line_count: usize,
+) -> Result<(), SharedString> {
+    let Node::Root(root) = root else {
+        return Err("markdown parser returned a non-root node".into());
+    };
+    let definition_count = reference_definition_count + footnote_definition_count;
+    if root.children.len() <= definition_count
+        || !root.children[..reference_definition_count]
+            .iter()
+            .all(|node| matches!(node, Node::Definition(_)))
+        || !root.children[reference_definition_count..definition_count]
+            .iter()
+            .all(|node| matches!(node, Node::FootnoteDefinition(_)))
+        || !matches!(
+            &root.children[definition_count],
+            Node::Paragraph(paragraph)
+                if matches!(
+                    paragraph.children.as_slice(),
+                    [Node::Text(text)] if text.value == DEFINITION_BOUNDARY
+                )
+        )
+    {
+        return Err("failed to reconstruct retained Markdown definitions".into());
+    }
+
+    root.children.drain(..=definition_count);
+    for node in &mut root.children {
+        rebase_position(node, prefix_len, prefix_line_count)?;
+    }
+    Ok(())
+}
+
+fn rebase_position(
+    node: &mut Node,
+    prefix_len: usize,
+    prefix_line_count: usize,
+) -> Result<(), SharedString> {
+    match node {
+        Node::MdxjsEsm(node) => rebase_stops(&mut node.stops, prefix_len)?,
+        Node::MdxFlowExpression(node) => rebase_stops(&mut node.stops, prefix_len)?,
+        Node::MdxTextExpression(node) => rebase_stops(&mut node.stops, prefix_len)?,
+        Node::MdxJsxFlowElement(node) => {
+            rebase_attribute_stops(&mut node.attributes, prefix_len)?;
+        }
+        Node::MdxJsxTextElement(node) => {
+            rebase_attribute_stops(&mut node.attributes, prefix_len)?;
+        }
+        _ => {}
+    }
+    if let Some(position) = node.position_mut() {
+        if position.start.offset < prefix_len
+            || position.end.offset < prefix_len
+            || position.start.line <= prefix_line_count
+            || position.end.line <= prefix_line_count
+        {
+            return Err("Markdown node crossed the retained-definition prefix boundary".into());
+        }
+
+        position.start.offset -= prefix_len;
+        position.end.offset -= prefix_len;
+        position.start.line -= prefix_line_count;
+        position.end.line -= prefix_line_count;
+    }
+    if let Some(children) = node.children_mut() {
+        for child in children {
+            rebase_position(child, prefix_len, prefix_line_count)?;
+        }
+    }
+    Ok(())
+}
+
+fn rebase_attribute_stops(
+    attributes: &mut [mdast::AttributeContent],
+    prefix_len: usize,
+) -> Result<(), SharedString> {
+    for attribute in attributes {
+        match attribute {
+            mdast::AttributeContent::Expression(expression) => {
+                rebase_stops(&mut expression.stops, prefix_len)?;
+            }
+            mdast::AttributeContent::Property(property) => {
+                if let Some(mdast::AttributeValue::Expression(expression)) = &mut property.value {
+                    rebase_stops(&mut expression.stops, prefix_len)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rebase_stops(stops: &mut [mdast::Stop], prefix_len: usize) -> Result<(), SharedString> {
+    for (_, source_offset) in stops {
+        if *source_offset < prefix_len {
+            return Err("MDX stop crossed the retained-definition prefix boundary".into());
+        }
+        *source_offset -= prefix_len;
+    }
+    Ok(())
 }
 
 fn parse_table_row(
@@ -350,8 +573,10 @@ fn ast_to_document(
     source: &str,
     prepared_source: &str,
     root: mdast::Node,
+    parse_options: &markdown::ParseOptions,
     cx: &mut NodeContext,
 ) -> ParsedDocument {
+    collect_definitions(prepared_source, &root, parse_options, cx);
     let root = match root {
         Node::Root(r) => r,
         _ => panic!("expected root node"),
@@ -365,6 +590,172 @@ fn ast_to_document(
     ParsedDocument {
         source: source.to_string().into(),
         blocks,
+    }
+}
+
+/// Collect document-wide parse metadata before presentation plugins can
+/// replace a definition or one of its ancestor blocks.
+fn collect_definitions(
+    prepared_source: &str,
+    node: &Node,
+    options: &markdown::ParseOptions,
+    cx: &mut NodeContext,
+) {
+    match node {
+        Node::Definition(definition) => {
+            let identifier: SharedString = definition.identifier.clone().into();
+            cx.add_link_definition(
+                identifier.clone(),
+                reparseable_definition_source_identifier(prepared_source, definition, options),
+                LinkMark {
+                    url: definition.url.clone().into(),
+                    identifier: Some(identifier),
+                    title: definition.title.clone().map(Into::into),
+                },
+                definition
+                    .position
+                    .as_ref()
+                    .map(|position| cx.offset + position.start.offset),
+            );
+        }
+        Node::FootnoteDefinition(definition) => {
+            cx.add_footnote_definition(
+                definition.identifier.clone().into(),
+                reparseable_footnote_definition_source_identifier(
+                    prepared_source,
+                    definition,
+                    options,
+                ),
+                definition
+                    .position
+                    .as_ref()
+                    .map(|position| cx.offset + position.start.offset),
+            );
+        }
+        _ => {}
+    }
+    if let Some(children) = node.children() {
+        for child in children {
+            collect_definitions(prepared_source, child, options, cx);
+        }
+    }
+}
+
+/// Find a label spelling that can be replayed outside its original container
+/// and still produces the same normalized mdast identifier.
+///
+/// The exact source spelling is preferred because Unicode case folding can
+/// expand a valid label beyond markdown-rs's label-size limit. Container
+/// continuation markers may occur inside the definition position, however, so
+/// every candidate is parsed and checked before it is retained.
+fn reparseable_definition_source_identifier(
+    prepared_source: &str,
+    definition: &mdast::Definition,
+    options: &markdown::ParseOptions,
+) -> Option<SharedString> {
+    reparseable_source_identifier(
+        extract_positioned_definition_label(prepared_source, definition.position.as_ref(), "["),
+        &definition.identifier,
+        DefinitionKind::Link,
+        options,
+    )
+}
+
+fn reparseable_footnote_definition_source_identifier(
+    prepared_source: &str,
+    definition: &mdast::FootnoteDefinition,
+    options: &markdown::ParseOptions,
+) -> Option<SharedString> {
+    reparseable_source_identifier(
+        extract_positioned_definition_label(prepared_source, definition.position.as_ref(), "[^"),
+        &definition.identifier,
+        DefinitionKind::Footnote,
+        options,
+    )
+}
+
+fn reparseable_source_identifier(
+    source_identifier: Option<&str>,
+    normalized_identifier: &str,
+    kind: DefinitionKind,
+    options: &markdown::ParseOptions,
+) -> Option<SharedString> {
+    for candidate in [source_identifier, Some(normalized_identifier)]
+        .into_iter()
+        .flatten()
+    {
+        if standalone_definition_identifier_matches(candidate, normalized_identifier, kind, options)
+        {
+            return Some(candidate.to_string().into());
+        }
+    }
+    None
+}
+
+fn extract_positioned_definition_label<'a>(
+    prepared_source: &'a str,
+    position: Option<&markdown::unist::Position>,
+    prefix: &str,
+) -> Option<&'a str> {
+    let position = position?;
+    let source = prepared_source.get(position.start.offset..position.end.offset)?;
+    extract_definition_label(source, prefix)
+}
+
+fn extract_definition_label<'a>(source: &'a str, prefix: &str) -> Option<&'a str> {
+    let label_start = source.find(prefix)? + prefix.len();
+    let mut bracket_depth = 0usize;
+    let mut escaped = false;
+
+    for (relative_offset, character) in source[label_start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '[' => bracket_depth += 1,
+            ']' if bracket_depth > 0 => bracket_depth -= 1,
+            ']' => {
+                let label_end = label_start + relative_offset;
+                if source[label_end + 1..].starts_with(':') {
+                    return source.get(label_start..label_end);
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+enum DefinitionKind {
+    Link,
+    Footnote,
+}
+
+fn standalone_definition_identifier_matches(
+    source_identifier: &str,
+    expected_identifier: &str,
+    kind: DefinitionKind,
+    options: &markdown::ParseOptions,
+) -> bool {
+    let source = match kind {
+        DefinitionKind::Link => format!("[{source_identifier}]: /"),
+        DefinitionKind::Footnote => format!("[^{source_identifier}]: /"),
+    };
+    let Ok(Node::Root(root)) = markdown::to_mdast(&source, options) else {
+        return false;
+    };
+    match (kind, root.children.as_slice()) {
+        (DefinitionKind::Link, [Node::Definition(definition)]) => {
+            definition.identifier == expected_identifier
+        }
+        (DefinitionKind::Footnote, [Node::FootnoteDefinition(definition)]) => {
+            definition.identifier == expected_identifier
+        }
+        _ => false,
     }
 }
 
@@ -551,23 +942,12 @@ fn ast_to_node(
             paragraph.span = new_span(def.position, cx);
             BlockNode::Paragraph(paragraph)
         }
-        Node::Definition(def) => {
-            cx.add_ref(
-                def.identifier.clone().into(),
-                LinkMark {
-                    url: def.url.clone().into(),
-                    identifier: Some(def.identifier.clone().into()),
-                    title: def.title.clone().map(Into::into),
-                },
-            );
-
-            BlockNode::Definition {
-                identifier: def.identifier.clone().into(),
-                url: def.url.clone().into(),
-                title: def.title.clone().map(|s| s.into()),
-                span: new_span(def.position, cx),
-            }
-        }
+        Node::Definition(def) => BlockNode::Definition {
+            identifier: def.identifier.clone().into(),
+            url: def.url.clone().into(),
+            title: def.title.clone().map(|s| s.into()),
+            span: new_span(def.position, cx),
+        },
         _ => {
             if cfg!(debug_assertions) {
                 tracing::warn!("unsupported node: {:#?}", value);
@@ -722,6 +1102,28 @@ mod tests {
     }
 
     #[test]
+    fn reference_definitions_retain_reparseable_source_identifiers() {
+        for source_identifier in [r"a\]b", r"a\[b\]c", "a&#93;b", "a\nb"] {
+            let mut cx = NodeContext::default();
+            parse(&format!("[{source_identifier}]: /"), &mut cx)
+                .expect("reference definition should parse");
+
+            assert_eq!(
+                cx.link_ref_source_identifiers.len(),
+                1,
+                "definition did not parse for {source_identifier:?}"
+            );
+            assert_eq!(
+                cx.link_ref_source_identifiers
+                    .values()
+                    .next()
+                    .map(|identifier| identifier.as_ref()),
+                Some(source_identifier)
+            );
+        }
+    }
+
+    #[test]
     fn inline_parser_preserves_original_source_and_native_ancestor_marks() {
         let source = "before **[$x$](https://example.com)** after";
         let mut cx = NodeContext {
@@ -809,6 +1211,297 @@ mod tests {
         assert_eq!(custom.as_text(), r"\(x\)");
         assert_eq!(custom.as_markdown(), r"\(x\)");
         assert_eq!(custom.span, Some(Span { start: 7, end: 12 }));
+    }
+
+    #[test]
+    fn retained_references_preserve_inline_source_views_and_ranges() {
+        let extensions = MarkdownExtensions::default()
+            .parse_options(|options| options.constructs.math_text = true)
+            .prepare_source(|source| source.replace(r"\(", "$$").replace(r"\)", "$$"))
+            .inline_parser(|node, cx| {
+                let Node::InlineMath(_) = node else {
+                    return None;
+                };
+                Some(MarkdownNode::new(
+                    "retained-reference-source-views",
+                    (
+                        cx.source().to_string(),
+                        cx.prepared_source().to_string(),
+                        cx.node_source(node)?.to_string(),
+                        cx.prepared_node_source(node)?.to_string(),
+                        cx.node_range(node)?,
+                    ),
+                ))
+            });
+        let mut cx = NodeContext {
+            offset: 11,
+            markdown_extensions: extensions.into(),
+            ..NodeContext::default()
+        };
+
+        let source = r"\(x\)";
+        let document = parse_with_reference_identifiers(source, &["ref".into()], &mut cx).unwrap();
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        let custom = paragraph.children[0].custom.as_ref().unwrap();
+        assert_eq!(
+            custom.data::<(String, String, String, String, Range<usize>)>(),
+            Some(&(
+                source.to_string(),
+                "$$x$$".to_string(),
+                source.to_string(),
+                "$$x$$".to_string(),
+                11..16,
+            ))
+        );
+        assert_eq!(custom.span, Some(Span { start: 11, end: 16 }));
+        assert_eq!(document.source.as_ref(), source);
+    }
+
+    #[test]
+    fn reference_prefix_counts_all_markdown_line_endings() {
+        assert_eq!(markdown_line_ending_count("a\nb\rc\r\nd"), 3);
+    }
+
+    fn collect_mdx_source_offsets(node: &Node, offsets: &mut Vec<usize>) {
+        let mut collect_stops = |stops: &[mdast::Stop]| {
+            offsets.extend(stops.iter().map(|(_, source_offset)| *source_offset));
+        };
+        match node {
+            Node::MdxjsEsm(node) => collect_stops(&node.stops),
+            Node::MdxFlowExpression(node) => collect_stops(&node.stops),
+            Node::MdxTextExpression(node) => collect_stops(&node.stops),
+            Node::MdxJsxFlowElement(node) => {
+                collect_attribute_source_offsets(&node.attributes, offsets);
+            }
+            Node::MdxJsxTextElement(node) => {
+                collect_attribute_source_offsets(&node.attributes, offsets);
+            }
+            _ => {}
+        }
+        if let Some(children) = node.children() {
+            for child in children {
+                collect_mdx_source_offsets(child, offsets);
+            }
+        }
+    }
+
+    fn collect_attribute_source_offsets(
+        attributes: &[mdast::AttributeContent],
+        offsets: &mut Vec<usize>,
+    ) {
+        for attribute in attributes {
+            let stops = match attribute {
+                mdast::AttributeContent::Expression(expression) => &expression.stops,
+                mdast::AttributeContent::Property(property) => {
+                    let Some(mdast::AttributeValue::Expression(expression)) = &property.value
+                    else {
+                        continue;
+                    };
+                    &expression.stops
+                }
+            };
+            offsets.extend(stops.iter().map(|(_, source_offset)| *source_offset));
+        }
+    }
+
+    fn mdx_source_offset_extensions() -> MarkdownExtensions {
+        MarkdownExtensions::default()
+            .mdx()
+            .parse_options(|options| {
+                options.constructs.mdx_esm = true;
+                options.mdx_expression_parse = Some(Box::new(|_, _| markdown::MdxSignal::Ok));
+                options.mdx_esm_parse = Some(Box::new(|_| markdown::MdxSignal::Ok));
+            })
+            .block_parser(|node, cx| {
+                let mut offsets = Vec::new();
+                collect_mdx_source_offsets(node, &mut offsets);
+                if offsets.is_empty() {
+                    return None;
+                }
+                Some(
+                    MarkdownNode::new("mdx-source-offsets", offsets)
+                        .text(cx.node_source(node)?.to_string()),
+                )
+            })
+    }
+
+    fn parse_mdx_source_offsets(
+        source: &str,
+        reference_identifiers: &[SharedString],
+    ) -> Vec<usize> {
+        let mut cx = NodeContext {
+            markdown_extensions: mdx_source_offset_extensions().into(),
+            ..NodeContext::default()
+        };
+        let document = parse_with_reference_identifiers(source, reference_identifiers, &mut cx)
+            .expect("MDX source should parse");
+        let BlockNode::Custom(custom) = &document.blocks[0] else {
+            panic!("expected observed MDX block for {source:?}");
+        };
+        custom
+            .data::<Vec<usize>>()
+            .expect("expected captured MDX source offsets")
+            .clone()
+    }
+
+    #[test]
+    fn retained_references_preserve_mdx_stop_offsets() {
+        for source in [
+            "before {alpha} <Widget value={beta} {...gamma}>child {delta}</Widget> after",
+            "{flow}",
+            "export const value = 1",
+        ] {
+            let expected = parse_mdx_source_offsets(source, &[]);
+            assert!(!expected.is_empty(), "expected MDX stops for {source:?}");
+
+            let actual = parse_mdx_source_offsets(source, &["ref".into()]);
+            assert_eq!(actual, expected, "MDX stops changed for {source:?}");
+            assert!(
+                actual.iter().all(|offset| *offset <= source.len()),
+                "MDX stop escaped source for {source:?}: {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_references_report_mdx_errors_in_fragment_coordinates() {
+        let extensions = MarkdownExtensions::default().mdx();
+        let source = "{";
+        let mut baseline_cx = NodeContext {
+            markdown_extensions: extensions.clone().into(),
+            ..NodeContext::default()
+        };
+        let expected = parse(source, &mut baseline_cx).expect_err("MDX should be incomplete");
+
+        let mut retained_cx = NodeContext {
+            markdown_extensions: extensions.into(),
+            ..NodeContext::default()
+        };
+        let actual = parse_with_reference_identifiers(source, &["ref".into()], &mut retained_cx)
+            .expect_err("MDX should remain incomplete");
+
+        assert_eq!(actual, expected);
+        assert!(actual.starts_with("1:2:"), "unexpected MDX error: {actual}");
+    }
+
+    #[test]
+    fn retained_references_do_not_leak_into_unclosed_fenced_code() {
+        let source = "```text\n[value][ref]";
+        let mut cx = NodeContext::default();
+
+        let document = parse_with_reference_identifiers(source, &["ref".into()], &mut cx).unwrap();
+        let BlockNode::CodeBlock(code) = &document.blocks[0] else {
+            panic!("expected fenced code block");
+        };
+        assert_eq!(code.code().as_ref(), "[value][ref]");
+        assert_eq!(
+            code.span,
+            Some(Span {
+                start: 0,
+                end: source.len()
+            })
+        );
+        assert_eq!(document.source.as_ref(), source);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ObservedBlockSource {
+        source: String,
+        prepared_source: String,
+        node_source: String,
+        range: Range<usize>,
+    }
+
+    fn observe_unclosed_block_extensions() -> MarkdownExtensions {
+        MarkdownExtensions::default()
+            .parse_options(|options| options.constructs.math_flow = true)
+            .block_parser(|node, cx| {
+                let name = match node {
+                    Node::Html(_) => "observed-html",
+                    Node::Math(_) => "observed-math",
+                    _ => return None,
+                };
+                let node_source = cx.node_source(node)?.to_string();
+                Some(
+                    MarkdownNode::new(
+                        name,
+                        ObservedBlockSource {
+                            source: cx.source().to_string(),
+                            prepared_source: cx.prepared_source().to_string(),
+                            node_source: node_source.clone(),
+                            range: cx.node_range(node)?,
+                        },
+                    )
+                    .text(node_source.clone())
+                    .markdown(node_source),
+                )
+            })
+    }
+
+    #[test]
+    fn retained_references_do_not_leak_into_unclosed_html_or_math() {
+        for source in ["<div>\n[value][ref]", "$$\n[value][ref]"] {
+            let mut cx = NodeContext {
+                offset: 5,
+                markdown_extensions: observe_unclosed_block_extensions().into(),
+                ..NodeContext::default()
+            };
+
+            let document =
+                parse_with_reference_identifiers(source, &["ref".into()], &mut cx).unwrap();
+            let BlockNode::Custom(custom) = &document.blocks[0] else {
+                panic!("expected observed custom block for {source:?}");
+            };
+            assert_eq!(
+                custom.data::<ObservedBlockSource>(),
+                Some(&ObservedBlockSource {
+                    source: source.to_string(),
+                    prepared_source: source.to_string(),
+                    node_source: source.to_string(),
+                    range: 5..5 + source.len(),
+                })
+            );
+            assert_eq!(
+                custom.span,
+                Some(Span {
+                    start: 5,
+                    end: 5 + source.len()
+                })
+            );
+            assert_eq!(document.source.as_ref(), source);
+        }
+    }
+
+    #[test]
+    fn retained_references_preserve_eof_hard_break_semantics() {
+        for source in ["[value][ref]  ", "[value][ref]\\"] {
+            let mut cx = NodeContext::default();
+            let document =
+                parse_with_reference_identifiers(source, &["ref".into()], &mut cx).unwrap();
+            let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
+                panic!("expected paragraph for {source:?}");
+            };
+
+            assert!(!paragraph.text().contains('\n'));
+            assert_eq!(
+                paragraph.span,
+                Some(Span {
+                    start: 0,
+                    end: source.len()
+                })
+            );
+            assert!(paragraph.children.iter().any(|child| {
+                child.marks.iter().any(|(_, mark)| {
+                    mark.link
+                        .as_ref()
+                        .and_then(|link| link.identifier.as_deref())
+                        == Some("ref")
+                })
+            }));
+            assert_eq!(document.source.as_ref(), source);
+        }
     }
 
     #[test]
