@@ -42,7 +42,7 @@ impl TitleBar {
         TitlebarOptions {
             title: None,
             appears_transparent: true,
-            traffic_light_position: Some(gpui::point(px(9.0), px(9.0))),
+            traffic_light_position: Some(gpui::point(px(9.0), px(10.0))),
         }
     }
 
@@ -331,5 +331,18 @@ impl RenderOnce for TitleBar {
                     on_close_window: self.on_close_window,
                 }),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_traffic_lights_are_centered_in_title_bar() {
+        assert_eq!(
+            TitleBar::title_bar_options().traffic_light_position,
+            Some(gpui::point(px(9.), px(10.)))
+        );
     }
 }
