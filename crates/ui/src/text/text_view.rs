@@ -10,7 +10,9 @@ use gpui::{
 use crate::StyledExt;
 use crate::scroll::ScrollableElement;
 use crate::text::TextViewFormat;
-use crate::text::markdown_ext::{MarkdownExtensions, MarkdownNode, MarkdownPlugin};
+use crate::text::markdown_ext::{
+    MarkdownExtensions, MarkdownInline, MarkdownInlineRenderContext, MarkdownNode, MarkdownPlugin,
+};
 use crate::text::node::CodeBlock;
 use crate::text::state::TextViewState;
 use crate::{global_state::GlobalState, text::TextViewStyle};
@@ -214,6 +216,56 @@ impl TextView {
         self
     }
 
+    /// Configure the `markdown-rs` options used by this TextView.
+    pub fn markdown_parse_options<F>(mut self, configure: F) -> Self
+    where
+        F: Fn(&mut markdown::ParseOptions) + Send + Sync + 'static,
+    {
+        Arc::make_mut(&mut self.markdown_extensions).push_parse_options(configure);
+        self
+    }
+
+    /// Register a length-preserving source preparation step.
+    pub fn markdown_prepare_source<F>(mut self, prepare: F) -> Self
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        Arc::make_mut(&mut self.markdown_extensions).push_source_preparer(prepare);
+        self
+    }
+
+    /// Register a custom inline-level Markdown parser.
+    pub fn markdown_inline_parser<F>(mut self, parser: F) -> Self
+    where
+        F: for<'a> Fn(
+                &markdown::mdast::Node,
+                &crate::text::MarkdownParseContext<'a>,
+            ) -> Option<MarkdownNode>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Arc::make_mut(&mut self.markdown_extensions).push_inline_parser(parser);
+        self
+    }
+
+    /// Register a renderer for a custom inline Markdown node name.
+    pub fn markdown_inline_renderer<F>(mut self, name: impl Into<SharedString>, renderer: F) -> Self
+    where
+        F: Fn(
+                &MarkdownNode,
+                &MarkdownInlineRenderContext,
+                &mut Window,
+                &mut App,
+            ) -> Option<MarkdownInline>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Arc::make_mut(&mut self.markdown_extensions).push_inline_renderer(name, renderer);
+        self
+    }
+
     /// Apply a reusable text view plugin.
     pub fn plugin<P>(self, plugin: P) -> Self
     where
@@ -356,13 +408,19 @@ impl Element for TextView {
 #[cfg(test)]
 mod tests {
     use super::{TextView, TextViewPlugin};
+    use std::{
+        ops::Range,
+        sync::{Arc, Mutex},
+    };
+
     use crate::text::{
-        InlineFlow, InlineFlowItem, InlineMetrics, MarkdownExtensions, MarkdownNode, TextViewState,
+        InlineFlow, InlineFlowItem, InlineMetrics, MarkdownExtensions, MarkdownInline,
+        MarkdownNode, TextViewState,
     };
     use gpui::{
-        AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, Modifiers,
-        MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, Render, Styled as _,
-        TestAppContext, VisualTestContext, Window, div, point, px,
+        AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
+        Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, Render,
+        Styled as _, TestAppContext, VisualTestContext, Window, div, point, px,
     };
 
     struct TextViewTestRoot {
@@ -412,6 +470,31 @@ mod tests {
     struct AtomicInlineFlowTextViewTestRoot {
         text_view: Entity<TextViewState>,
         extensions: MarkdownExtensions,
+    }
+
+    #[derive(Debug)]
+    struct InlineRenderSnapshot {
+        heading_level: Option<u8>,
+        font_size: gpui::AbsoluteLength,
+        font_weight: FontWeight,
+        bold: bool,
+        link: Option<String>,
+        source_range: Range<usize>,
+    }
+
+    struct MarkdownInlinePluginTestRoot {
+        text_view: Entity<TextViewState>,
+        extensions: MarkdownExtensions,
+    }
+
+    impl Render for MarkdownInlinePluginTestRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(320.)).child(
+                TextView::new(&self.text_view)
+                    .markdown_extensions(self.extensions.clone())
+                    .selectable(true),
+            )
+        }
     }
 
     impl AtomicInlineFlowTextViewTestRoot {
@@ -592,6 +675,105 @@ mod tests {
             large.size.height > small.size.height * 2.,
             "captured 30px typography should measure substantially taller than 10px: {small:?} vs {large:?}"
         );
+    }
+
+    #[gpui::test]
+    fn markdown_inline_renderer_receives_native_heading_mark_link_and_range(
+        cx: &mut TestAppContext,
+    ) {
+        const SOURCE: &str = "# before **[$x$](https://example.com)** after";
+
+        cx.update(crate::init);
+        let snapshots = Arc::new(Mutex::new(Vec::<InlineRenderSnapshot>::new()));
+        let renderer_snapshots = snapshots.clone();
+        let extensions = MarkdownExtensions::default()
+            .parse_options(|options| options.constructs.math_text = true)
+            .inline_parser(|node, _| {
+                let markdown::mdast::Node::InlineMath(math) = node else {
+                    return None;
+                };
+                Some(MarkdownNode::new("math-inline", math.value.clone()))
+            })
+            .inline_renderer("math-inline", move |_, context, _, _| {
+                if let Ok(mut snapshots) = renderer_snapshots.lock() {
+                    snapshots.push(InlineRenderSnapshot {
+                        heading_level: context.heading_level(),
+                        font_size: context.text_style().font_size,
+                        font_weight: context.text_style().font_weight,
+                        bold: context.mark().bold,
+                        link: context.link().map(|link| link.url.to_string()),
+                        source_range: context.source_range(),
+                    });
+                }
+                Some(MarkdownInline::new(
+                    InlineMetrics::new(px(24.), px(14.), px(4.)),
+                    div()
+                        .debug_selector(|| "markdown-inline-plugin-item".into())
+                        .w(px(24.))
+                        .h(px(18.)),
+                ))
+            });
+        let text_view = cx.update(|cx| cx.new(|cx| TextViewState::markdown(SOURCE, cx)));
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let content = cx.new(|_| MarkdownInlinePluginTestRoot {
+                text_view: text_view.clone(),
+                extensions,
+            });
+            crate::Root::new(content, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(cx.debug_bounds("markdown-inline-plugin-item").is_some());
+        let snapshots = snapshots.lock().unwrap();
+        let snapshot = snapshots.last().expect("inline renderer should run");
+        let start = SOURCE.find("$x$").unwrap();
+        assert_eq!(snapshot.heading_level, Some(1));
+        assert_eq!(snapshot.font_size, px(28.).into());
+        assert_eq!(snapshot.font_weight, FontWeight::BOLD);
+        assert!(snapshot.bold);
+        assert_eq!(snapshot.link.as_deref(), Some("https://example.com"));
+        assert_eq!(snapshot.source_range, start..start + 3);
+    }
+
+    #[gpui::test]
+    fn pending_markdown_inline_renderer_keeps_selectable_delimiter_text(cx: &mut TestAppContext) {
+        const SOURCE: &str = "before **$x$** after";
+
+        cx.update(crate::init);
+        let extensions = MarkdownExtensions::default()
+            .parse_options(|options| options.constructs.math_text = true)
+            .inline_parser(|node, _| {
+                let markdown::mdast::Node::InlineMath(math) = node else {
+                    return None;
+                };
+                Some(MarkdownNode::new("pending-math", math.value.clone()))
+            })
+            .inline_renderer("pending-math", |_, _, _, _| None);
+        let text_view = cx.update(|cx| cx.new(|cx| TextViewState::markdown(SOURCE, cx)));
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let content = cx.new(|_| MarkdownInlinePluginTestRoot {
+                text_view: text_view.clone(),
+                extensions,
+            });
+            crate::Root::new(content, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        text_view.update(cx, |state, cx| state.select_all(cx));
+
+        text_view.read_with(cx, |state, _| {
+            assert_eq!(state.selected_text().trim(), "before $x$ after");
+            assert_eq!(state.source().as_ref(), SOURCE);
+        });
     }
 
     #[gpui::test]

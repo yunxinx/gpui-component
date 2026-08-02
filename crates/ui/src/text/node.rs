@@ -9,7 +9,7 @@ use gpui::{
     AnyElement, App, DefiniteLength, Div, ElementId, FontStyle, FontWeight, Half, HighlightStyle,
     Hsla, InteractiveElement as _, IntoElement, Length, ObjectFit, Overflow, ParentElement,
     ScrollHandle, SharedString, SharedUri, StatefulInteractiveElement, Styled, StyledImage as _,
-    Window, div, img, prelude::FluentBuilder as _, px, relative, rems,
+    TextStyle, Window, div, img, prelude::FluentBuilder as _, px, relative, rems,
 };
 use markdown::mdast;
 use ropey::Rope;
@@ -20,7 +20,7 @@ use crate::{
     input::{InputEdit, Point, RopeExt as _},
     scroll::horizontal_scroll_area,
     text::{
-        CodeBlockActionsFn, MarkdownExtensions, MarkdownNode,
+        CodeBlockActionsFn, MarkdownExtensions, MarkdownInlineRenderContext, MarkdownNode,
         document::NodeRenderOptions,
         inline::{Inline, InlineState},
         inline_flow::{InlineFlow, InlineFlowItem, InlineFlowState},
@@ -382,6 +382,69 @@ impl TextMark {
     }
 }
 
+fn resolve_text_mark(mark: &TextMark, node_cx: &NodeContext) -> TextMark {
+    let mut resolved = mark.clone();
+    if let Some(link) = resolved.link.as_mut()
+        && let Some(identifier) = link.identifier.as_ref()
+        && let Some(reference) = node_cx.link_refs.get(identifier)
+    {
+        *link = reference.clone();
+    }
+    resolved
+}
+
+fn highlight_for_mark(mark: &TextMark, cx: &App) -> HighlightStyle {
+    let mut highlight = HighlightStyle::default();
+    if mark.bold {
+        highlight.font_weight = Some(FontWeight::BOLD);
+    }
+    if mark.italic {
+        highlight.font_style = Some(FontStyle::Italic);
+    }
+    if mark.strikethrough {
+        highlight.strikethrough = Some(gpui::StrikethroughStyle {
+            thickness: px(1.),
+            ..Default::default()
+        });
+    }
+    if mark.underline {
+        highlight.underline = Some(gpui::UnderlineStyle {
+            thickness: px(1.),
+            ..Default::default()
+        });
+    }
+    if mark.code {
+        highlight.background_color = Some(cx.theme().accent);
+    }
+    if let Some(color) = mark.highlight {
+        highlight.background_color = Some(color);
+    }
+    if mark.link.is_some() {
+        highlight.color = Some(cx.theme().link);
+        highlight.underline = Some(gpui::UnderlineStyle {
+            thickness: px(1.),
+            ..Default::default()
+        });
+    }
+    highlight
+}
+
+fn flush_inline_flow_text(
+    items: &mut Vec<InlineFlowItem>,
+    text: &mut String,
+    highlights: &mut Vec<(Range<usize>, HighlightStyle)>,
+    links: &mut Vec<(Range<usize>, LinkMark)>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    items.push(
+        InlineFlowItem::text(std::mem::take(text))
+            .with_links(std::mem::take(links))
+            .highlights(std::mem::take(highlights)),
+    );
+}
+
 /// The bytes
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 pub struct Span {
@@ -431,6 +494,7 @@ pub(crate) struct InlineNode {
     /// The text content.
     pub(crate) text: SharedString,
     pub(crate) image: Option<ImageNode>,
+    pub(crate) custom: Option<MarkdownNode>,
     /// The text styles, each tuple contains the range of the text and the style.
     pub(crate) marks: Vec<(Range<usize>, TextMark)>,
 
@@ -439,7 +503,10 @@ pub(crate) struct InlineNode {
 
 impl PartialEq for InlineNode {
     fn eq(&self, other: &Self) -> bool {
-        self.text == other.text && self.image == other.image && self.marks == other.marks
+        self.text == other.text
+            && self.image == other.image
+            && self.custom == other.custom
+            && self.marks == other.marks
     }
 }
 
@@ -448,6 +515,7 @@ impl InlineNode {
         Self {
             text: text.into(),
             image: None,
+            custom: None,
             marks: vec![],
             state: Arc::new(Mutex::new(InlineState::default())),
         }
@@ -459,9 +527,27 @@ impl InlineNode {
         this
     }
 
+    pub(crate) fn custom(custom: MarkdownNode) -> Self {
+        let mut this = Self::new(custom.as_text().to_string());
+        this.custom = Some(custom);
+        this
+    }
+
     pub(crate) fn marks(mut self, marks: Vec<(Range<usize>, TextMark)>) -> Self {
         self.marks = marks;
         self
+    }
+
+    pub(crate) fn merge_full_mark(&mut self, mark: TextMark) {
+        let len = self.text.len();
+        if let Some(last) = self.marks.last_mut()
+            && last.0.start == 0
+            && last.0.end == len
+        {
+            last.1.merge(mark);
+        } else if len > 0 {
+            self.marks.push((0..len, mark));
+        }
     }
 }
 
@@ -637,7 +723,7 @@ impl Paragraph {
             || self
                 .children
                 .iter()
-                .all(|node| node.text.is_empty() && node.image.is_none())
+                .all(|node| node.text.is_empty() && node.image.is_none() && node.custom.is_none())
     }
 
     /// Return length of children text.
@@ -869,7 +955,13 @@ impl PartialEq for NodeContext {
 }
 
 impl Paragraph {
-    fn render(&self, node_cx: &NodeContext, _window: &mut Window, cx: &mut App) -> AnyElement {
+    fn render(
+        &self,
+        node_cx: &NodeContext,
+        heading_level: Option<u8>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
         let span = self.span;
         let children = &self.children;
 
@@ -877,7 +969,7 @@ impl Paragraph {
             return InlineFlow::new(
                 span.unwrap_or_default(),
                 self.flow_state.clone(),
-                self.inline_flow_items(node_cx, cx),
+                self.inline_flow_items(node_cx, heading_level, window, cx),
             )
             .into_any_element();
         }
@@ -1009,10 +1101,17 @@ impl Paragraph {
     fn should_render_inline_flow(&self) -> bool {
         let has_image = self.children.iter().any(|child| child.image.is_some());
         let has_text = self.children.iter().any(|child| !child.text.is_empty());
-        has_image && has_text
+        let has_custom = self.children.iter().any(|child| child.custom.is_some());
+        has_custom || (has_image && has_text)
     }
 
-    fn inline_flow_items(&self, node_cx: &NodeContext, cx: &mut App) -> Vec<InlineFlowItem> {
+    fn inline_flow_items(
+        &self,
+        node_cx: &NodeContext,
+        heading_level: Option<u8>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<InlineFlowItem> {
         let mut items = Vec::new();
         let mut text = String::new();
         let mut highlights: Vec<(Range<usize>, HighlightStyle)> = vec![];
@@ -1020,21 +1119,8 @@ impl Paragraph {
         let mut offset = 0;
 
         for inline_node in &self.children {
-            let text_len = inline_node.text.len();
-            text.push_str(&inline_node.text);
-
             if let Some(image) = &inline_node.image {
-                if !text.is_empty() {
-                    if let Ok(mut state) = inline_node.state.lock() {
-                        state.set_text(text.clone().into());
-                    }
-                    items.push(
-                        InlineFlowItem::text(text.clone())
-                            .with_links(links.clone())
-                            .highlights(highlights.clone()),
-                    );
-                }
-
+                flush_inline_flow_text(&mut items, &mut text, &mut highlights, &mut links);
                 items.push(
                     InlineFlowItem::image(
                         image.url.clone(),
@@ -1044,76 +1130,78 @@ impl Paragraph {
                     )
                     .with_image_link_mark(image.link.clone()),
                 );
-
-                text.clear();
-                links.clear();
-                highlights.clear();
                 offset = 0;
-            } else {
-                let mut node_highlights = vec![];
-                for (range, style) in &inline_node.marks {
-                    let inner_range = (offset + range.start)..(offset + range.end);
+                continue;
+            }
 
-                    let mut highlight = HighlightStyle::default();
-                    if style.bold {
-                        highlight.font_weight = Some(FontWeight::BOLD);
-                    }
-                    if style.italic {
-                        highlight.font_style = Some(FontStyle::Italic);
-                    }
-                    if style.strikethrough {
-                        highlight.strikethrough = Some(gpui::StrikethroughStyle {
-                            thickness: gpui::px(1.),
-                            ..Default::default()
-                        });
-                    }
-                    if style.underline {
-                        highlight.underline = Some(gpui::UnderlineStyle {
-                            thickness: gpui::px(1.),
-                            ..Default::default()
-                        });
-                    }
-                    if style.code {
-                        highlight.background_color = Some(cx.theme().accent);
-                    }
-                    if let Some(color) = style.highlight {
-                        highlight.background_color = Some(color);
-                    }
+            if let Some(custom) = &inline_node.custom {
+                flush_inline_flow_text(&mut items, &mut text, &mut highlights, &mut links);
+                offset = 0;
 
-                    if let Some(mut link_mark) = style.link.clone() {
-                        highlight.color = Some(cx.theme().link);
-                        highlight.underline = Some(gpui::UnderlineStyle {
-                            thickness: gpui::px(1.),
-                            ..Default::default()
-                        });
-
-                        if let Some(identifier) = link_mark.identifier.as_ref()
-                            && let Some(mark) = node_cx.link_refs.get(identifier)
-                        {
-                            link_mark = mark.clone();
-                        }
-
-                        links.push((inner_range.clone(), link_mark));
-                    }
-
-                    node_highlights.push((inner_range, highlight));
+                let mut mark = TextMark::default();
+                for (_, child_mark) in &inline_node.marks {
+                    mark.merge(child_mark.clone());
                 }
+                let mark = resolve_text_mark(&mark, node_cx);
+                let highlight = highlight_for_mark(&mark, cx);
+                let heading_style = heading_level.map(|level| node_cx.style.heading_style(level));
+                let mut text_style: TextStyle = window.text_style();
+                if let Some(heading) = heading_style {
+                    text_style.font_size = heading.font_size.into();
+                    text_style.font_weight = heading.font_weight;
+                }
+                text_style = text_style.highlight(highlight);
 
-                highlights = gpui::combine_highlights(highlights, node_highlights).collect();
-                offset += text_len;
+                let span = custom.span.or(self.span).unwrap_or_default();
+                let context = MarkdownInlineRenderContext::new(
+                    text_style,
+                    node_cx.style.clone(),
+                    heading_level,
+                    heading_style,
+                    mark.clone(),
+                    span.start..span.end,
+                );
+
+                if let Some(rendered) = node_cx
+                    .markdown_extensions
+                    .render_inline(custom, &context, window, cx)
+                {
+                    let (metrics, element) = rendered.into_parts();
+                    items.push(
+                        InlineFlowItem::custom(custom.as_text().to_string(), metrics, element)
+                            .with_custom_link_mark(mark.link),
+                    );
+                } else {
+                    let text_len = inline_node.text.len();
+                    let fallback_links = mark
+                        .link
+                        .map(|link| vec![(0..text_len, link)])
+                        .unwrap_or_default();
+                    items.push(
+                        InlineFlowItem::text(inline_node.text.clone())
+                            .with_links(fallback_links)
+                            .highlights(vec![(0..text_len, highlight)]),
+                    );
+                }
+                continue;
             }
+
+            let text_len = inline_node.text.len();
+            text.push_str(&inline_node.text);
+            let mut node_highlights = vec![];
+            for (range, style) in &inline_node.marks {
+                let inner_range = (offset + range.start)..(offset + range.end);
+                let resolved = resolve_text_mark(style, node_cx);
+                if let Some(link) = resolved.link.clone() {
+                    links.push((inner_range.clone(), link));
+                }
+                node_highlights.push((inner_range, highlight_for_mark(&resolved, cx)));
+            }
+            highlights = gpui::combine_highlights(highlights, node_highlights).collect();
+            offset += text_len;
         }
 
-        if !text.is_empty() {
-            if let Ok(mut state) = self.state.lock() {
-                state.set_text(text.clone().into());
-            }
-            items.push(
-                InlineFlowItem::text(text)
-                    .with_links(links)
-                    .highlights(highlights),
-            );
-        }
+        flush_inline_flow_text(&mut items, &mut text, &mut highlights, &mut links);
 
         items
     }
@@ -1125,27 +1213,53 @@ impl Paragraph {
             .children
             .iter()
             .map(|text_node| {
-                let mut text = text_node.text.to_string();
-                for (range, style) in &text_node.marks {
-                    if style.bold {
-                        text = format!("**{}**", &text_node.text[range.clone()]);
+                let mut text = if let Some(custom) = &text_node.custom {
+                    let mut text = custom.to_markdown();
+                    for (_, style) in &text_node.marks {
+                        if style.bold {
+                            text = format!("**{text}**");
+                        }
+                        if style.italic {
+                            text = format!("*{text}*");
+                        }
+                        if style.strikethrough {
+                            text = format!("~~{text}~~");
+                        }
+                        if style.code {
+                            text = format!("`{text}`");
+                        }
+                        if style.highlight.is_some() {
+                            text = format!("=={text}==");
+                        }
+                        if let Some(link) = &style.link {
+                            text = format!("[{text}]({})", link.url);
+                        }
                     }
-                    if style.italic {
-                        text = format!("*{}*", &text_node.text[range.clone()]);
+                    text
+                } else {
+                    let mut text = text_node.text.to_string();
+                    for (range, style) in &text_node.marks {
+                        if style.bold {
+                            text = format!("**{}**", &text_node.text[range.clone()]);
+                        }
+                        if style.italic {
+                            text = format!("*{}*", &text_node.text[range.clone()]);
+                        }
+                        if style.strikethrough {
+                            text = format!("~~{}~~", &text_node.text[range.clone()]);
+                        }
+                        if style.code {
+                            text = format!("`{}`", &text_node.text[range.clone()]);
+                        }
+                        if style.highlight.is_some() {
+                            text = format!("=={}==", &text_node.text[range.clone()]);
+                        }
+                        if let Some(link) = &style.link {
+                            text = format!("[{}]({})", &text_node.text[range.clone()], link.url);
+                        }
                     }
-                    if style.strikethrough {
-                        text = format!("~~{}~~", &text_node.text[range.clone()]);
-                    }
-                    if style.code {
-                        text = format!("`{}`", &text_node.text[range.clone()]);
-                    }
-                    if style.highlight.is_some() {
-                        text = format!("=={}==", &text_node.text[range.clone()]);
-                    }
-                    if let Some(link) = &style.link {
-                        text = format!("[{}]({})", &text_node.text[range.clone()], link.url);
-                    }
-                }
+                    text
+                };
 
                 if let Some(image) = &text_node.image {
                     let alt = image.alt.clone().unwrap_or_default();
@@ -1604,7 +1718,7 @@ impl BlockNode {
                             this.border_r_1().border_color(cx.theme().border)
                         })
                         .refine_style(&style.table_cell)
-                        .child(cell.children.render(node_cx, window, cx)),
+                        .child(cell.children.render(node_cx, None, window, cx)),
                 );
             }
             rows.push(
@@ -1688,7 +1802,7 @@ impl BlockNode {
                             this.border_r_1().border_color(cx.theme().border)
                         })
                         .refine_style(&style.table_cell)
-                        .child(cell.children.render(node_cx, window, cx)),
+                        .child(cell.children.render(node_cx, None, window, cx)),
                 );
             }
 
@@ -1745,7 +1859,7 @@ impl BlockNode {
             BlockNode::Paragraph(paragraph) => div()
                 .id(("p", ix))
                 .pb(mb)
-                .child(paragraph.render(node_cx, window, cx))
+                .child(paragraph.render(node_cx, None, window, cx))
                 .into_any_element(),
             BlockNode::Heading {
                 level, children, ..
@@ -1758,7 +1872,7 @@ impl BlockNode {
                     .whitespace_normal()
                     .text_size(heading.font_size)
                     .font_weight(heading.font_weight)
-                    .child(children.render(node_cx, window, cx))
+                    .child(children.render(node_cx, Some(*level), window, cx))
                     .into_any_element()
             }
             BlockNode::Blockquote { children, .. } => div()

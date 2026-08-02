@@ -856,4 +856,44 @@ mod tests {
             );
         });
     }
+
+    #[gpui::test]
+    fn inline_markdown_extensions_survive_streaming_append(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("before $x$", cx)));
+        cx.run_until_parked();
+
+        let extensions = MarkdownExtensions::default()
+            .parse_options(|options| options.constructs.math_text = true)
+            .inline_parser(|node, cx| {
+                let markdown::mdast::Node::InlineMath(math) = node else {
+                    return None;
+                };
+                Some(
+                    MarkdownNode::new("streaming-math", math.value.clone())
+                        .text(cx.node_source(node).unwrap_or_default()),
+                )
+            });
+        state.update(cx, |state, cx| {
+            state.set_markdown_extensions(Arc::new(extensions), cx);
+            state.push_str(" after $y$", cx);
+        });
+        cx.run_until_parked();
+
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.source().as_ref(), "before $x$ after $y$");
+            let node::BlockNode::Paragraph(paragraph) = &state.parsed_content.document.blocks[0]
+            else {
+                panic!("expected paragraph");
+            };
+            assert_eq!(
+                paragraph
+                    .children
+                    .iter()
+                    .filter(|child| child.custom.is_some())
+                    .count(),
+                2
+            );
+        });
+    }
 }

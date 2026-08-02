@@ -16,6 +16,7 @@ pub use inline_flow::{InlineFlow, InlineFlowItem, InlineFlowState, InlineMetrics
 #[doc(hidden)]
 pub use inline_flow::{InlineFlowLayoutState, InlineFlowPrepaintState};
 pub use markdown_ext::*;
+pub use node::{LinkMark, TextMark};
 pub use state::*;
 pub use style::*;
 pub use text_view::*;

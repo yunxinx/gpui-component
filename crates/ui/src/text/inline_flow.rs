@@ -273,6 +273,13 @@ impl InlineFlowItem {
         self
     }
 
+    pub(crate) fn with_custom_link_mark(mut self, custom_link: Option<LinkMark>) -> Self {
+        if let InlineFlowItemKind::Custom { link, .. } = &mut self.kind {
+            *link = custom_link;
+        }
+        self
+    }
+
     pub(crate) fn with_links(mut self, links: Vec<(Range<usize>, LinkMark)>) -> Self {
         if let InlineFlowItemKind::Text {
             links: item_links, ..

@@ -8,10 +8,14 @@ use std::{
     },
 };
 
-use gpui::{AnyElement, App, IntoElement, SharedString, Window};
+use gpui::{AnyElement, App, IntoElement, SharedString, TextStyle, Window};
 use markdown::{ParseOptions, mdast};
 
-use crate::text::node::Span;
+use crate::text::{
+    TextViewHeadingStyle, TextViewStyle,
+    inline_flow::InlineMetrics,
+    node::{LinkMark, Span, TextMark},
+};
 
 use super::inline_flow::InlineFlowState;
 
@@ -32,12 +36,34 @@ pub type MarkdownBlockParserFn =
 pub type MarkdownBlockRenderFn =
     dyn Fn(&MarkdownNode, &mut Window, &mut App) -> AnyElement + Send + Sync;
 
-/// A reusable Markdown extension that parses and renders one custom node.
+/// Type for configuring the Markdown parser options used by TextView.
+pub type MarkdownParseOptionsFn = dyn Fn(&mut ParseOptions) + Send + Sync;
+
+/// Type for preparing a length-preserving parse view of Markdown source.
+pub type MarkdownSourcePreparerFn = dyn Fn(&str) -> String + Send + Sync;
+
+/// Type for a custom Markdown inline parser.
+///
+/// Parsers run during Markdown AST conversion, often on a background task. As
+/// with block parsers, they must not depend on [`Window`] or [`App`].
+pub type MarkdownInlineParserFn =
+    dyn for<'a> Fn(&mdast::Node, &MarkdownParseContext<'a>) -> Option<MarkdownNode> + Send + Sync;
+
+/// Type for a custom Markdown inline renderer.
+pub type MarkdownInlineRenderFn = dyn Fn(&MarkdownNode, &MarkdownInlineRenderContext, &mut Window, &mut App) -> Option<MarkdownInline>
+    + Send
+    + Sync;
+
+/// A reusable Markdown extension retained for block-plugin compatibility.
+///
+/// New inline extensions should implement [`MarkdownInlinePlugin`], whose
+/// renderer supplies the metrics required by the native paragraph flow.
 pub trait MarkdownPlugin: Send + Sync + 'static {
     /// Whether this plugin produces block-level nodes.
     ///
-    /// Plugins are inline by default. TextView does not support inline custom
-    /// Markdown rendering yet, so block plugins should return `true`.
+    /// Existing block plugins should return `true`. A `false` plugin is parsed
+    /// as inline fallback text, but its legacy renderer is not invoked because
+    /// this trait cannot supply inline metrics.
     fn is_block(&self) -> bool {
         false
     }
@@ -52,20 +78,52 @@ pub trait MarkdownPlugin: Send + Sync + 'static {
     fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement;
 }
 
+/// A reusable Markdown extension that parses and renders an inline atomic
+/// node in TextView's native paragraph flow.
+pub trait MarkdownInlinePlugin: Send + Sync + 'static {
+    /// Stable name for nodes produced by this plugin.
+    fn name(&self) -> &str;
+
+    /// Convert an mdast inline node into a custom Markdown node.
+    fn parse(&self, node: &mdast::Node, cx: &MarkdownParseContext<'_>) -> Option<MarkdownNode>;
+
+    /// Render a parsed node as a baseline-aligned inline item.
+    ///
+    /// Returning `None` keeps the node's delimiter-preserving selectable text
+    /// fallback in the paragraph flow.
+    fn render(
+        &self,
+        node: &MarkdownNode,
+        context: &MarkdownInlineRenderContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<MarkdownInline>;
+}
+
 /// Context passed to custom Markdown parsers.
 pub struct MarkdownParseContext<'a> {
     source: &'a str,
+    prepared_source: &'a str,
     offset: usize,
 }
 
 impl<'a> MarkdownParseContext<'a> {
-    pub(crate) fn new(source: &'a str, offset: usize) -> Self {
-        Self { source, offset }
+    pub(crate) fn new(source: &'a str, prepared_source: &'a str, offset: usize) -> Self {
+        Self {
+            source,
+            prepared_source,
+            offset,
+        }
     }
 
     /// Source text for the Markdown fragment currently being parsed.
     pub fn source(&self) -> &'a str {
         self.source
+    }
+
+    /// Length-preserving source view used to produce the mdast nodes.
+    pub fn prepared_source(&self) -> &'a str {
+        self.prepared_source
     }
 
     /// Byte offset of `source` in the full document when parsing an appended
@@ -78,6 +136,106 @@ impl<'a> MarkdownParseContext<'a> {
     pub fn node_source(&self, node: &mdast::Node) -> Option<&'a str> {
         let position = node.position()?;
         self.source.get(position.start.offset..position.end.offset)
+    }
+
+    /// Prepared source slice for a specific mdast node.
+    pub fn prepared_node_source(&self, node: &mdast::Node) -> Option<&'a str> {
+        let position = node.position()?;
+        self.prepared_source
+            .get(position.start.offset..position.end.offset)
+    }
+
+    /// Absolute source range for a specific mdast node.
+    pub fn node_range(&self, node: &mdast::Node) -> Option<std::ops::Range<usize>> {
+        let position = node.position()?;
+        Some(self.offset + position.start.offset..self.offset + position.end.offset)
+    }
+}
+
+/// Rendered payload for one custom Markdown inline node.
+pub struct MarkdownInline {
+    metrics: InlineMetrics,
+    element: AnyElement,
+}
+
+impl MarkdownInline {
+    /// Create a baseline-aligned inline payload.
+    pub fn new(metrics: InlineMetrics, element: impl IntoElement) -> Self {
+        Self {
+            metrics,
+            element: element.into_any_element(),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (InlineMetrics, AnyElement) {
+        (self.metrics, self.element)
+    }
+}
+
+/// Effective native context for rendering a custom Markdown inline node.
+#[derive(Clone)]
+pub struct MarkdownInlineRenderContext {
+    text_style: TextStyle,
+    text_view_style: TextViewStyle,
+    heading_level: Option<u8>,
+    heading_style: Option<TextViewHeadingStyle>,
+    mark: TextMark,
+    source_range: std::ops::Range<usize>,
+}
+
+impl MarkdownInlineRenderContext {
+    pub(crate) fn new(
+        text_style: TextStyle,
+        text_view_style: TextViewStyle,
+        heading_level: Option<u8>,
+        heading_style: Option<TextViewHeadingStyle>,
+        mark: TextMark,
+        source_range: std::ops::Range<usize>,
+    ) -> Self {
+        Self {
+            text_style,
+            text_view_style,
+            heading_level,
+            heading_style,
+            mark,
+            source_range,
+        }
+    }
+
+    /// Fully resolved text style, including heading typography and inherited
+    /// Markdown marks.
+    pub fn text_style(&self) -> &TextStyle {
+        &self.text_style
+    }
+
+    /// TextView styling configuration active for this document.
+    pub fn text_view_style(&self) -> &TextViewStyle {
+        &self.text_view_style
+    }
+
+    /// Native heading level containing this node, if any.
+    pub fn heading_level(&self) -> Option<u8> {
+        self.heading_level
+    }
+
+    /// Resolved native heading typography containing this node, if any.
+    pub fn heading_style(&self) -> Option<TextViewHeadingStyle> {
+        self.heading_style
+    }
+
+    /// Merged Markdown mark inherited by this atomic node.
+    pub fn mark(&self) -> &TextMark {
+        &self.mark
+    }
+
+    /// Resolved link inherited by this node, including reference links.
+    pub fn link(&self) -> Option<&LinkMark> {
+        self.mark.link.as_ref()
+    }
+
+    /// Absolute byte range in the original Markdown document.
+    pub fn source_range(&self) -> std::ops::Range<usize> {
+        self.source_range.clone()
     }
 }
 
@@ -214,6 +372,15 @@ impl MarkdownNode {
         self.span = span;
     }
 
+    pub(crate) fn ensure_fallback(&mut self, source: &str) {
+        if self.text.is_empty() {
+            self.text = source.to_string().into();
+        }
+        if self.markdown.is_empty() {
+            self.markdown = source.to_string().into();
+        }
+    }
+
     pub(crate) fn to_markdown(&self) -> String {
         if self.markdown.is_empty() {
             self.text.to_string()
@@ -252,8 +419,12 @@ impl PartialEq for MarkdownNode {
 #[derive(Clone, Default)]
 pub struct MarkdownExtensions {
     enable_mdx: bool,
+    parse_options_configurers: Vec<Arc<MarkdownParseOptionsFn>>,
+    source_preparers: Vec<Arc<MarkdownSourcePreparerFn>>,
     block_parsers: Vec<Arc<MarkdownBlockParserFn>>,
     block_renderers: HashMap<SharedString, Arc<MarkdownBlockRenderFn>>,
+    inline_parsers: Vec<Arc<MarkdownInlineParserFn>>,
+    inline_renderers: HashMap<SharedString, Arc<MarkdownInlineRenderFn>>,
     revision: u64,
 }
 
@@ -265,6 +436,28 @@ impl MarkdownExtensions {
     pub fn mdx(mut self) -> Self {
         self.enable_mdx = true;
         self.bump_revision();
+        self
+    }
+
+    /// Configure the `markdown-rs` parse options, starting from GFM defaults.
+    pub fn parse_options<F>(mut self, configure: F) -> Self
+    where
+        F: Fn(&mut ParseOptions) + Send + Sync + 'static,
+    {
+        self.push_parse_options(configure);
+        self
+    }
+
+    /// Register a source preparation step that runs before mdast parsing.
+    ///
+    /// The returned parse view must have the same UTF-8 byte length and
+    /// character-boundary offsets as its input. TextView retains the original
+    /// source for selection, copying, node ranges, and incremental updates.
+    pub fn prepare_source<F>(mut self, prepare: F) -> Self
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        self.push_source_preparer(prepare);
         self
     }
 
@@ -290,6 +483,51 @@ impl MarkdownExtensions {
         self
     }
 
+    /// Register a parser for inline Markdown AST nodes.
+    pub fn inline_parser<F>(mut self, parser: F) -> Self
+    where
+        F: for<'a> Fn(&mdast::Node, &MarkdownParseContext<'a>) -> Option<MarkdownNode>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.push_inline_parser(parser);
+        self
+    }
+
+    /// Register a renderer for a custom inline node name.
+    pub fn inline_renderer<F>(mut self, name: impl Into<SharedString>, renderer: F) -> Self
+    where
+        F: Fn(
+                &MarkdownNode,
+                &MarkdownInlineRenderContext,
+                &mut Window,
+                &mut App,
+            ) -> Option<MarkdownInline>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.push_inline_renderer(name, renderer);
+        self
+    }
+
+    /// Apply a reusable typed inline Markdown plugin.
+    pub fn inline_plugin<P>(self, plugin: P) -> Self
+    where
+        P: MarkdownInlinePlugin,
+    {
+        let plugin = Arc::new(plugin);
+        let name = SharedString::from(plugin.name().to_string());
+        let parser = plugin.clone();
+        let renderer = plugin;
+
+        self.inline_parser(move |node, cx| parser.parse(node, cx))
+            .inline_renderer(name, move |node, context, window, cx| {
+                renderer.render(node, context, window, cx)
+            })
+    }
+
     /// Apply a reusable Markdown plugin.
     pub fn plugin<P>(self, plugin: P) -> Self
     where
@@ -307,7 +545,10 @@ impl MarkdownExtensions {
             });
             extensions
         } else {
-            panic!("inline Markdown plugins are not supported by TextView yet")
+            // The historical plugin trait cannot supply inline metrics. Keep
+            // its parsed text as a safe fallback; new inline plugins should
+            // use `inline_plugin` or the typed inline parser/renderer pair.
+            self.inline_parser(move |node, cx| parser.parse(node, cx))
         }
     }
 
@@ -326,6 +567,50 @@ impl MarkdownExtensions {
         self.bump_revision();
     }
 
+    pub(crate) fn push_parse_options<F>(&mut self, configure: F)
+    where
+        F: Fn(&mut ParseOptions) + Send + Sync + 'static,
+    {
+        self.parse_options_configurers.push(Arc::new(configure));
+        self.bump_revision();
+    }
+
+    pub(crate) fn push_source_preparer<F>(&mut self, prepare: F)
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        self.source_preparers.push(Arc::new(prepare));
+        self.bump_revision();
+    }
+
+    pub(crate) fn push_inline_parser<F>(&mut self, parser: F)
+    where
+        F: for<'a> Fn(&mdast::Node, &MarkdownParseContext<'a>) -> Option<MarkdownNode>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.inline_parsers.push(Arc::new(parser));
+        self.bump_revision();
+    }
+
+    pub(crate) fn push_inline_renderer<F>(&mut self, name: impl Into<SharedString>, renderer: F)
+    where
+        F: Fn(
+                &MarkdownNode,
+                &MarkdownInlineRenderContext,
+                &mut Window,
+                &mut App,
+            ) -> Option<MarkdownInline>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.inline_renderers
+            .insert(name.into(), Arc::new(renderer));
+        self.bump_revision();
+    }
+
     pub(crate) fn push_block_renderer<F, E>(&mut self, name: impl Into<SharedString>, renderer: F)
     where
         F: Fn(&MarkdownNode, &mut Window, &mut App) -> E + Send + Sync + 'static,
@@ -338,7 +623,7 @@ impl MarkdownExtensions {
         self.bump_revision();
     }
 
-    pub(crate) fn parse_options(&self) -> ParseOptions {
+    pub(crate) fn configured_parse_options(&self) -> ParseOptions {
         let mut options = ParseOptions::gfm();
         if self.enable_mdx {
             options.constructs.html_flow = false;
@@ -348,7 +633,42 @@ impl MarkdownExtensions {
             options.constructs.mdx_jsx_flow = true;
             options.constructs.mdx_jsx_text = true;
         }
+        for configure in &self.parse_options_configurers {
+            configure(&mut options);
+        }
         options
+    }
+
+    pub(crate) fn prepared_source(&self, source: &str) -> Result<String, SharedString> {
+        let mut prepared = source.to_string();
+        for prepare in &self.source_preparers {
+            let next = prepare(&prepared);
+            if next.len() != prepared.len() {
+                return Err(format!(
+                    "Markdown source preparation must preserve the same UTF-8 byte length (expected {}, got {})",
+                    prepared.len(),
+                    next.len()
+                )
+                .into());
+            }
+
+            let boundaries_match = prepared
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .chain(std::iter::once(prepared.len()))
+                .eq(next
+                    .char_indices()
+                    .map(|(offset, _)| offset)
+                    .chain(std::iter::once(next.len())));
+            if !boundaries_match {
+                return Err(
+                    "Markdown source preparation must preserve the same UTF-8 character boundaries"
+                        .into(),
+                );
+            }
+            prepared = next;
+        }
+        Ok(prepared)
     }
 
     pub(crate) fn parse_block(
@@ -357,6 +677,19 @@ impl MarkdownExtensions {
         cx: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
         for parser in &self.block_parsers {
+            if let Some(node) = parser(node, cx) {
+                return Some(node);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn parse_inline(
+        &self,
+        node: &mdast::Node,
+        cx: &MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        for parser in &self.inline_parsers {
             if let Some(node) = parser(node, cx) {
                 return Some(node);
             }
@@ -375,6 +708,18 @@ impl MarkdownExtensions {
             .map(|render| render(node, window, cx))
     }
 
+    pub(crate) fn render_inline(
+        &self,
+        node: &MarkdownNode,
+        context: &MarkdownInlineRenderContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<MarkdownInline> {
+        self.inline_renderers
+            .get(node.name())
+            .and_then(|render| render(node, context, window, cx))
+    }
+
     fn bump_revision(&mut self) {
         self.revision = MARKDOWN_EXTENSIONS_REVISION.fetch_add(1, Ordering::Relaxed);
     }
@@ -384,10 +729,75 @@ impl MarkdownExtensions {
 mod tests {
     use super::*;
 
+    struct DummyInlinePlugin;
+
+    impl MarkdownInlinePlugin for DummyInlinePlugin {
+        fn name(&self) -> &str {
+            "dummy-inline"
+        }
+
+        fn parse(
+            &self,
+            _node: &mdast::Node,
+            _cx: &MarkdownParseContext<'_>,
+        ) -> Option<MarkdownNode> {
+            None
+        }
+
+        fn render(
+            &self,
+            _node: &MarkdownNode,
+            _context: &MarkdownInlineRenderContext,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Option<MarkdownInline> {
+            None
+        }
+    }
+
+    #[test]
+    fn markdown_extensions_builder_configures_all_extension_stages() {
+        let extensions = MarkdownExtensions::default()
+            .mdx()
+            .parse_options(|options| options.constructs.math_text = true)
+            .prepare_source(|source| source.replace("ab", "cd"))
+            .block_parser(|_, _| None)
+            .block_renderer("block", |_, _, _| gpui::div())
+            .inline_parser(|_, _| None)
+            .inline_renderer("inline", |_, _, _, _| None);
+
+        let options = extensions.configured_parse_options();
+        assert!(options.constructs.math_text);
+        assert!(options.constructs.mdx_expression_text);
+        assert!(!options.constructs.html_text);
+        assert_eq!(extensions.prepared_source("ab").unwrap(), "cd");
+        assert_eq!(extensions.block_parsers.len(), 1);
+        assert_eq!(extensions.block_renderers.len(), 1);
+        assert_eq!(extensions.inline_parsers.len(), 1);
+        assert_eq!(extensions.inline_renderers.len(), 1);
+        assert_ne!(extensions.revision(), 0);
+
+        let plugin_extensions = MarkdownExtensions::default().inline_plugin(DummyInlinePlugin);
+        assert_eq!(plugin_extensions.inline_parsers.len(), 1);
+        assert!(
+            plugin_extensions
+                .inline_renderers
+                .contains_key("dummy-inline")
+        );
+    }
+
     #[test]
     fn markdown_node_mixed_flow_builders_preserve_default_and_exact_break_modes() {
-        let default = MarkdownNode::new("default-flow", ())
+        let default = MarkdownNode::new("default-flow", 42_u8)
+            .text("visible")
+            .markdown("**visible**")
+            .heading(2)
             .inline_flow_states([InlineFlowState::default(), InlineFlowState::default()]);
+        assert_eq!(default.name(), "default-flow");
+        assert_eq!(default.as_text(), "visible");
+        assert_eq!(default.as_markdown(), "**visible**");
+        assert_eq!(default.data::<u8>(), Some(&42));
+        assert_eq!(default.heading_level(), Some(2));
         assert_eq!(default.attached_inline_flow_states().len(), 2);
         assert_eq!(default.attached_inline_flow_breaks_before(), None);
 
