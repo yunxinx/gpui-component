@@ -250,6 +250,11 @@ impl TextViewState {
             append,
             pending_text: text.to_string(),
             markdown_extensions: self.markdown_extensions.clone(),
+            // Full replacements are applied synchronously below. The worker
+            // still receives them so its incremental snapshot stays in sync,
+            // but publishing the same revision a second time would clear a
+            // selection made between the synchronous parse and worker poll.
+            publish_result: append,
         };
 
         // Full-replace updates (initial content / `set_text`) parse
@@ -274,6 +279,10 @@ impl TextViewState {
                     self.parsed_error = Some(err);
                 }
             }
+            // Preserve the exact update order for the background parser. A
+            // later append can now build on this replacement instead of the
+            // worker's previous document snapshot.
+            _ = self.tx.try_send(update_options);
             cx.notify();
             return;
         }
@@ -490,6 +499,10 @@ pub(crate) struct ParsedContent {
 struct UpdateFuture {
     format: TextViewFormat,
     content: ParsedContent,
+    /// Authoritative source consumed by this worker, retained independently
+    /// from the last successfully parsed document so an append can recover by
+    /// reparsing the full source after an earlier parse error.
+    source: String,
     rx: Pin<Box<Receiver<UpdateOptions>>>,
     tx_result: Sender<ParsedUpdate>,
 }
@@ -503,9 +516,39 @@ impl UpdateFuture {
         Self {
             format,
             content: Default::default(),
+            source: String::new(),
             rx: Box::pin(rx),
             tx_result,
         }
+    }
+
+    fn parse(&mut self, options: &UpdateOptions) -> Result<ParsedContent, SharedString> {
+        let previous_source = self.source.clone();
+        if options.append {
+            self.source.push_str(&options.pending_text);
+        } else {
+            self.source.clear();
+            self.source.push_str(&options.pending_text);
+        }
+
+        // Incremental parsing is valid only when the last successfully parsed
+        // document represents the exact source preceding this append. If a
+        // replacement failed to parse, keep its raw source and recover with a
+        // full parse once a later append makes the document valid.
+        let can_append = options.append && self.content.document.source.as_ref() == previous_source;
+        let effective_options = if can_append {
+            options.clone()
+        } else {
+            UpdateOptions {
+                revision: options.revision,
+                pending_text: self.source.clone(),
+                append: false,
+                markdown_extensions: options.markdown_extensions.clone(),
+                publish_result: options.publish_result,
+            }
+        };
+
+        parse_content(self.format, self.content.clone(), &effective_options)
     }
 }
 
@@ -519,14 +562,16 @@ impl Future for UpdateFuture {
                     let hit_coalesce_budget =
                         merge_pending_options(&mut options, self.rx.as_ref().get_ref());
 
-                    let res = parse_content(self.format, self.content.clone(), &options);
+                    let res = self.parse(&options);
                     if let Ok(content) = &res {
                         self.content = content.clone();
                     }
-                    _ = self.tx_result.try_send(ParsedUpdate {
-                        revision: options.revision,
-                        result: res,
-                    });
+                    if options.publish_result {
+                        _ = self.tx_result.try_send(ParsedUpdate {
+                            revision: options.revision,
+                            result: res,
+                        });
+                    }
                     if hit_coalesce_budget {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
@@ -546,6 +591,7 @@ struct UpdateOptions {
     pending_text: String,
     append: bool,
     markdown_extensions: Arc<MarkdownExtensions>,
+    publish_result: bool,
 }
 
 impl UpdateOptions {
@@ -553,6 +599,7 @@ impl UpdateOptions {
         if next.append {
             self.pending_text.push_str(&next.pending_text);
             self.revision = next.revision;
+            self.publish_result |= next.publish_result;
         } else {
             *self = next;
         }
@@ -632,15 +679,14 @@ mod tests {
         cx.run_until_parked();
 
         state.update(cx, |state, cx| {
-            state.set_text("", cx);
-            state.push_str("new", cx);
+            state.set_text("replacement", cx);
             state.push_str(" text", cx);
         });
         cx.run_until_parked();
 
         state.read_with(cx, |state, _| {
-            assert_eq!(state.text.as_str(), "new text");
-            assert_eq!(state.source().as_str(), "new text");
+            assert_eq!(state.text.as_str(), "replacement text");
+            assert_eq!(state.source().as_str(), "replacement text");
         });
 
         state.update(cx, |state, cx| {
@@ -661,6 +707,7 @@ mod tests {
             pending_text: "old".to_string(),
             append: true,
             markdown_extensions: Arc::default(),
+            publish_result: true,
         };
 
         options.merge(UpdateOptions {
@@ -668,17 +715,20 @@ mod tests {
             pending_text: "new".to_string(),
             append: false,
             markdown_extensions: Arc::default(),
+            publish_result: false,
         });
         options.merge(UpdateOptions {
             revision: 3,
             pending_text: " text".to_string(),
             append: true,
             markdown_extensions: Arc::default(),
+            publish_result: true,
         });
 
         assert_eq!(options.revision, 3);
         assert_eq!(options.pending_text, "new text");
         assert!(!options.append);
+        assert!(options.publish_result);
     }
 
     #[test]
@@ -693,6 +743,7 @@ mod tests {
                 pending_text: format!("{revision}\n"),
                 append: revision != 1,
                 markdown_extensions: Arc::default(),
+                publish_result: true,
             })
             .unwrap();
         }
@@ -747,6 +798,24 @@ mod tests {
     }
 
     #[gpui::test]
+    fn synchronous_replacement_worker_sync_does_not_clear_new_selection(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("old", cx)));
+        cx.run_until_parked();
+
+        state.update(cx, |state, cx| {
+            state.set_text("replacement", cx);
+            state.select_all(cx);
+        });
+        cx.run_until_parked();
+
+        state.read_with(cx, |state, _| {
+            assert!(state.has_view_selection());
+            assert_eq!(state.selected_text().trim(), "replacement");
+        });
+    }
+
+    #[gpui::test]
     fn set_markdown_extensions_reparses_existing_text(cx: &mut TestAppContext) {
         cx.update(crate::init);
         let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("$TSLA.US", cx)));
@@ -771,15 +840,20 @@ mod tests {
 
         state.update(cx, |state, cx| {
             state.set_markdown_extensions(Arc::new(extensions), cx);
+            state.push_str(" rose", cx);
         });
         cx.run_until_parked();
 
         state.read_with(cx, |state, _| {
+            assert_eq!(state.source().as_str(), "$TSLA.US rose");
             let node::BlockNode::Custom(node) = &state.parsed_content.document.blocks[0] else {
                 panic!("expected custom markdown node");
             };
             assert_eq!(node.name(), "ticker");
-            assert_eq!(node.data::<String>().map(String::as_str), Some("TSLA.US"));
+            assert_eq!(
+                node.data::<String>().map(String::as_str),
+                Some("TSLA.US rose")
+            );
         });
     }
 }
