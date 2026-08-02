@@ -23,7 +23,7 @@ use crate::{
         CodeBlockActionsFn, MarkdownExtensions, MarkdownNode,
         document::NodeRenderOptions,
         inline::{Inline, InlineState},
-        inline_flow::{InlineFlow, InlineFlowItem},
+        inline_flow::{InlineFlow, InlineFlowItem, InlineFlowState},
     },
     tooltip::Tooltip,
     v_flex,
@@ -207,12 +207,49 @@ impl BlockNode {
                 }
             }
             BlockNode::Custom(node) => {
-                if let BlockTextKind::All = kind {
-                    let content = node.as_text();
-                    if !content.is_empty() {
-                        text.push_str(content);
-                        text.push('\n');
+                let content = match kind {
+                    BlockTextKind::All => node.as_text().to_string(),
+                    BlockTextKind::Selected => {
+                        let mut selected = String::new();
+                        if let Some(breaks_before) = node.attached_inline_flow_breaks_before() {
+                            let mut has_selected_fragment = false;
+                            let mut pending_breaks = 0;
+                            for (state_ix, state) in
+                                node.attached_inline_flow_states().iter().enumerate()
+                            {
+                                let fragment = state.selected_text();
+                                if has_selected_fragment {
+                                    pending_breaks +=
+                                        breaks_before.get(state_ix).copied().unwrap_or(1);
+                                }
+                                if fragment.is_empty() {
+                                    continue;
+                                }
+                                if has_selected_fragment {
+                                    selected.extend(std::iter::repeat_n('\n', pending_breaks));
+                                }
+                                selected.push_str(&fragment);
+                                has_selected_fragment = true;
+                                pending_breaks = 0;
+                            }
+                        } else {
+                            for state in node.attached_inline_flow_states() {
+                                let fragment = state.selected_text();
+                                if fragment.is_empty() {
+                                    continue;
+                                }
+                                if !selected.is_empty() {
+                                    selected.push('\n');
+                                }
+                                selected.push_str(&fragment);
+                            }
+                        }
+                        selected
                     }
+                };
+                if !content.is_empty() {
+                    text.push_str(&content);
+                    text.push('\n');
                 }
             }
             BlockNode::Definition { .. }
@@ -257,8 +294,12 @@ impl BlockNode {
                 }
             }
             BlockNode::CodeBlock(code_block) => code_block.clear_selection(),
-            BlockNode::Custom { .. }
-            | BlockNode::Definition { .. }
+            BlockNode::Custom(node) => {
+                for state in node.attached_inline_flow_states() {
+                    state.clear_selection();
+                }
+            }
+            BlockNode::Definition { .. }
             | BlockNode::Break { .. }
             | BlockNode::HorizontalRule { .. }
             | BlockNode::Unknown { .. } => {}
@@ -438,6 +479,7 @@ pub(crate) struct Paragraph {
     pub(super) link_refs: HashMap<SharedString, SharedString>,
 
     pub(crate) state: Arc<Mutex<InlineState>>,
+    pub(crate) flow_state: InlineFlowState,
 }
 
 impl PartialEq for Paragraph {
@@ -455,10 +497,14 @@ impl Paragraph {
             children: vec![InlineNode::new(&text)],
             link_refs: HashMap::new(),
             state: Arc::new(Mutex::new(InlineState::default())),
+            flow_state: InlineFlowState::default(),
         }
     }
 
     pub(super) fn selected_text(&self) -> String {
+        if self.should_render_inline_flow() {
+            return self.flow_state.selected_text();
+        }
         let mut text = String::new();
 
         for c in self.children.iter() {
@@ -491,6 +537,10 @@ impl Paragraph {
     ///
     /// Mirrors the [`selected_text`](Self::selected_text) traversal.
     pub(super) fn clear_selection(&self) {
+        if self.should_render_inline_flow() {
+            self.flow_state.clear_selection();
+            return;
+        }
         for c in self.children.iter() {
             if let Ok(mut state) = c.state.lock() {
                 state.selection = None;
@@ -555,6 +605,7 @@ impl Paragraph {
                 children: vec![],
                 link_refs: Default::default(),
                 state: Arc::new(Mutex::new(InlineState::default())),
+                flow_state: InlineFlowState::default(),
             },
         )
     }
@@ -825,6 +876,7 @@ impl Paragraph {
         if self.should_render_inline_flow() {
             return InlineFlow::new(
                 span.unwrap_or_default(),
+                self.flow_state.clone(),
                 self.inline_flow_items(node_cx, cx),
             )
             .into_any_element();
@@ -976,21 +1028,22 @@ impl Paragraph {
                     if let Ok(mut state) = inline_node.state.lock() {
                         state.set_text(text.clone().into());
                     }
-                    items.push(InlineFlowItem::Text {
-                        state: inline_node.state.clone(),
-                        text: text.clone().into(),
-                        links: links.clone(),
-                        highlights: highlights.clone(),
-                    });
+                    items.push(
+                        InlineFlowItem::text(text.clone())
+                            .with_links(links.clone())
+                            .highlights(highlights.clone()),
+                    );
                 }
 
-                items.push(InlineFlowItem::Image {
-                    url: image.url.clone(),
-                    link: image.link.clone(),
-                    title: image.title(),
-                    width: image.width,
-                    height: image.height,
-                });
+                items.push(
+                    InlineFlowItem::image(
+                        image.url.clone(),
+                        image.title(),
+                        image.width,
+                        image.height,
+                    )
+                    .with_image_link_mark(image.link.clone()),
+                );
 
                 text.clear();
                 links.clear();
@@ -1055,12 +1108,11 @@ impl Paragraph {
             if let Ok(mut state) = self.state.lock() {
                 state.set_text(text.clone().into());
             }
-            items.push(InlineFlowItem::Text {
-                state: self.state.clone(),
-                text: text.into(),
-                links,
-                highlights,
-            });
+            items.push(
+                InlineFlowItem::text(text)
+                    .with_links(links)
+                    .highlights(highlights),
+            );
         }
 
         items
@@ -1698,27 +1750,14 @@ impl BlockNode {
             BlockNode::Heading {
                 level, children, ..
             } => {
-                let (text_size, font_weight) = match level {
-                    1 => (rems(2.), FontWeight::BOLD),
-                    2 => (rems(1.5), FontWeight::SEMIBOLD),
-                    3 => (rems(1.25), FontWeight::SEMIBOLD),
-                    4 => (rems(1.125), FontWeight::SEMIBOLD),
-                    5 => (rems(1.), FontWeight::SEMIBOLD),
-                    6 => (rems(1.), FontWeight::MEDIUM),
-                    _ => (rems(1.), FontWeight::NORMAL),
-                };
-
-                let mut text_size = text_size.to_pixels(node_cx.style.heading_base_font_size);
-                if let Some(f) = node_cx.style.heading_font_size.as_ref() {
-                    text_size = (f)(*level, node_cx.style.heading_base_font_size);
-                }
+                let heading = node_cx.style.heading_style(*level);
 
                 div()
                     .id(SharedString::from(format!("h{}-{}", level, ix)))
-                    .pb(rems(0.3))
+                    .pb(heading.padding_bottom)
                     .whitespace_normal()
-                    .text_size(text_size)
-                    .font_weight(font_weight)
+                    .text_size(heading.font_size)
+                    .font_weight(heading.font_weight)
                     .child(children.render(node_cx, window, cx))
                     .into_any_element()
             }
@@ -1782,7 +1821,19 @@ impl BlockNode {
                     None => div().child(node.as_text().to_string()).into_any_element(),
                 };
 
-                div().pb(mb).child(inner).into_any_element()
+                if let Some(level) = node.heading_level() {
+                    let heading = node_cx.style.heading_style(level);
+                    div()
+                        .id(SharedString::from(format!("h{}-{}", level, ix)))
+                        .pb(heading.padding_bottom)
+                        .whitespace_normal()
+                        .text_size(heading.font_size)
+                        .font_weight(heading.font_weight)
+                        .child(inner)
+                        .into_any_element()
+                } else {
+                    div().pb(mb).child(inner).into_any_element()
+                }
             }
             BlockNode::Table { .. } => {
                 Self::render_table(self, &options, node_cx, window, cx).into_any_element()

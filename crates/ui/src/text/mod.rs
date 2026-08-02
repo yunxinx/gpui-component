@@ -12,6 +12,9 @@ mod utils;
 mod window_selection;
 
 use gpui::{App, ElementId, IntoElement, RenderOnce, SharedString, Window};
+pub use inline_flow::{InlineFlow, InlineFlowItem, InlineFlowState, InlineMetrics};
+#[doc(hidden)]
+pub use inline_flow::{InlineFlowLayoutState, InlineFlowPrepaintState};
 pub use markdown_ext::*;
 pub use state::*;
 pub use style::*;

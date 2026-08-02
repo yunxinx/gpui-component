@@ -2,7 +2,8 @@ use gpui::Half;
 use std::ops::Range;
 
 use gpui::{
-    App, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextAlign, Window, point, px, size,
+    App, Boundary, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextAlign, TextRun, Window,
+    WindowTextSystem, point, px, size,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
@@ -259,15 +260,67 @@ impl TextWrapper {
         new_text: &Rope,
         cx: &mut App,
     ) {
-        let mut line_wrapper = cx
+        let mut fallback_wrapper = cx
             .text_system()
             .line_wrapper(self.font.clone(), self.font_size);
+        let text_system = WindowTextSystem::new(cx.text_system().clone());
+        let font = self.font.clone();
+        let font_size = self.font_size;
         self._update(
             changed_text,
             range,
             new_text,
             &mut |line_str, wrap_width| {
-                line_wrapper
+                if line_str.is_empty() {
+                    return Vec::new();
+                }
+
+                // Isolated character advances can select a different fallback
+                // font from the surrounding shaped run (notably for CJK
+                // fullwidth punctuation on macOS). Derive production wrap
+                // points from the same shaping pipeline used for painting, and
+                // retain LineWrapper as a non-destructive fallback if shaping
+                // cannot produce a usable line.
+                let run = TextRun {
+                    len: line_str.len(),
+                    font: font.clone(),
+                    ..Default::default()
+                };
+                if let Ok(lines) = text_system.shape_text(
+                    line_str.to_string().into(),
+                    font_size,
+                    &[run],
+                    Some(wrap_width),
+                    None,
+                ) && let Some(line) = lines.first()
+                {
+                    let boundaries = line
+                        .wrap_boundaries()
+                        .iter()
+                        .filter_map(|boundary| {
+                            line.runs()
+                                .get(boundary.run_ix)?
+                                .glyphs
+                                .get(boundary.glyph_ix)
+                                .map(|glyph| Boundary {
+                                    ix: glyph.index,
+                                    next_indent: 0,
+                                })
+                        })
+                        .collect::<Vec<_>>();
+                    let boundaries_are_valid =
+                        boundaries.iter().enumerate().all(|(ix, boundary)| {
+                            boundary.ix
+                                > boundaries.get(ix.wrapping_sub(1)).map_or(0, |prev| prev.ix)
+                                && boundary.ix < line_str.len()
+                                && line_str.is_char_boundary(boundary.ix)
+                        });
+                    if boundaries.len() == line.wrap_boundaries().len() && boundaries_are_valid {
+                        return boundaries;
+                    }
+                }
+
+                fallback_wrapper
                     .wrap_line(&[LineFragment::text(line_str)], wrap_width)
                     .collect()
             },

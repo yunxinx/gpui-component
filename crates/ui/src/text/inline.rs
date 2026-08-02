@@ -39,6 +39,12 @@ pub(crate) struct InlineState {
     pub(super) selection: Option<Selection>,
 }
 
+pub(crate) struct InlinePrepaintState {
+    hitbox: Hitbox,
+    text_hitboxes: Vec<Hitbox>,
+    text_bounds: Vec<Bounds<Pixels>>,
+}
+
 impl InlineState {
     /// Save actually rendered text for selected text to use.
     pub(crate) fn set_text(&mut self, text: SharedString) {
@@ -321,7 +327,7 @@ impl IntoElement for Inline {
 
 impl Element for Inline {
     type RequestLayoutState = ();
-    type PrepaintState = Hitbox;
+    type PrepaintState = InlinePrepaintState;
 
     fn id(&self) -> Option<ElementId> {
         Some(self.id.clone())
@@ -374,7 +380,21 @@ impl Element for Inline {
             .prepaint(id, inspector_id, bounds, &mut (), window, cx);
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        hitbox
+        let text_layout = self.styled_text.layout();
+        let text_bounds = self.text_line_bounds(
+            text_layout,
+            text_layout.line_height(),
+            window.content_mask().bounds,
+        );
+        let text_hitboxes = text_bounds
+            .iter()
+            .map(|bounds| window.insert_hitbox(*bounds, HitboxBehavior::Normal))
+            .collect();
+        InlinePrepaintState {
+            hitbox,
+            text_hitboxes,
+            text_bounds,
+        }
     }
 
     fn paint(
@@ -388,7 +408,7 @@ impl Element for Inline {
         cx: &mut App,
     ) {
         let current_view = window.current_view();
-        let hitbox = prepaint;
+        let hitbox = &prepaint.hitbox;
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -404,7 +424,9 @@ impl Element for Inline {
         state.selection = selection;
 
         if is_selection || is_selectable {
-            window.set_cursor_style(CursorStyle::IBeam, &hitbox);
+            for text_hitbox in &prepaint.text_hitboxes {
+                window.set_cursor_style(CursorStyle::IBeam, text_hitbox);
+            }
         }
 
         // link cursor pointer
@@ -419,14 +441,9 @@ impl Element for Inline {
 
         if is_selectable {
             if let Some(text_view_state) = GlobalState::global(cx).text_view_state().cloned() {
-                let text_bounds = self.text_line_bounds(
-                    &text_layout,
-                    text_layout.line_height(),
-                    window.content_mask().bounds,
-                );
                 crate::Root::register_selectable_text_inline(
                     &text_view_state,
-                    text_bounds,
+                    prepaint.text_bounds.clone(),
                     window,
                     cx,
                 );
@@ -553,7 +570,7 @@ fn selection_for_multi_click(
 }
 
 /// Check if a `pos` is within a `bounds`, considering multi-line selections.
-fn point_in_text_selection(
+pub(super) fn point_in_text_selection(
     pos: Point<Pixels>,
     char_width: Pixels,
     selection_start: Point<Pixels>,

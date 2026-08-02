@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gpui::{Pixels, Rems, StyleRefinement, px, rems};
+use gpui::{FontWeight, Pixels, Rems, StyleRefinement, px, rems};
 
 use crate::highlighter::HighlightTheme;
 
@@ -32,6 +32,17 @@ pub struct TextViewStyle {
     pub is_dark: bool,
 }
 
+/// Resolved typography for one Markdown heading level.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextViewHeadingStyle {
+    /// Resolved heading font size.
+    pub font_size: Pixels,
+    /// Heading font weight.
+    pub font_weight: FontWeight,
+    /// Bottom padding used by the native heading renderer.
+    pub padding_bottom: Rems,
+}
+
 impl PartialEq for TextViewStyle {
     fn eq(&self, other: &Self) -> bool {
         self.paragraph_gap == other.paragraph_gap
@@ -56,6 +67,33 @@ impl Default for TextViewStyle {
 }
 
 impl TextViewStyle {
+    /// Resolve the same heading typography and spacing used by the native
+    /// Markdown renderer.
+    ///
+    /// Block plugins that replace a heading can use this to preserve native
+    /// heading behavior without duplicating the level switch.
+    pub fn heading_style(&self, level: u8) -> TextViewHeadingStyle {
+        let (size, font_weight) = match level {
+            1 => (rems(2.), FontWeight::BOLD),
+            2 => (rems(1.5), FontWeight::SEMIBOLD),
+            3 => (rems(1.25), FontWeight::SEMIBOLD),
+            4 => (rems(1.125), FontWeight::SEMIBOLD),
+            5 => (rems(1.), FontWeight::SEMIBOLD),
+            6 => (rems(1.), FontWeight::MEDIUM),
+            _ => (rems(1.), FontWeight::NORMAL),
+        };
+        let font_size = self.heading_font_size.as_ref().map_or_else(
+            || size.to_pixels(self.heading_base_font_size),
+            |resolve| resolve(level, self.heading_base_font_size),
+        );
+
+        TextViewHeadingStyle {
+            font_size,
+            font_weight,
+            padding_bottom: rems(0.3),
+        }
+    }
+
     /// Set paragraph gap, default is 1 rem.
     pub fn paragraph_gap(mut self, gap: Rems) -> Self {
         self.paragraph_gap = gap;
@@ -89,5 +127,34 @@ impl TextViewStyle {
     pub fn table_cell(mut self, style: StyleRefinement) -> Self {
         self.table_cell = style;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heading_style_resolves_native_levels_and_custom_font_sizes() {
+        let style = TextViewStyle::default();
+        assert_eq!(
+            style.heading_style(1),
+            TextViewHeadingStyle {
+                font_size: px(28.),
+                font_weight: FontWeight::BOLD,
+                padding_bottom: rems(0.3),
+            }
+        );
+        assert_eq!(
+            style.heading_style(6),
+            TextViewHeadingStyle {
+                font_size: px(14.),
+                font_weight: FontWeight::MEDIUM,
+                padding_bottom: rems(0.3),
+            }
+        );
+
+        let custom = TextViewStyle::default().heading_font_size(|level, _| px(level as f32));
+        assert_eq!(custom.heading_style(3).font_size, px(3.));
     }
 }

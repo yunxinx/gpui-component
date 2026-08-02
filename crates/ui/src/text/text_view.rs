@@ -356,7 +356,9 @@ impl Element for TextView {
 #[cfg(test)]
 mod tests {
     use super::{TextView, TextViewPlugin};
-    use crate::text::TextViewState;
+    use crate::text::{
+        InlineFlow, InlineFlowItem, InlineMetrics, MarkdownExtensions, MarkdownNode, TextViewState,
+    };
     use gpui::{
         AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, Modifiers,
         MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, Render, Styled as _,
@@ -400,6 +402,115 @@ mod tests {
 
     struct InlineImageTextViewTestRoot {
         text_view: Entity<TextViewState>,
+    }
+
+    struct InlineFlowStyleTestRoot {
+        small_state: crate::text::InlineFlowState,
+        large_state: crate::text::InlineFlowState,
+    }
+
+    struct AtomicInlineFlowTextViewTestRoot {
+        text_view: Entity<TextViewState>,
+        extensions: MarkdownExtensions,
+    }
+
+    impl AtomicInlineFlowTextViewTestRoot {
+        fn new(cx: &mut Context<Self>) -> Self {
+            let extensions = MarkdownExtensions::default()
+                .block_parser(|node, _| {
+                    let markdown::mdast::Node::Paragraph(_) = node else {
+                        return None;
+                    };
+                    Some(
+                        MarkdownNode::new("atomic-inline-flow", ())
+                            .text("before $x$\nafter")
+                            .inline_flow_state(Default::default()),
+                    )
+                })
+                .block_renderer("atomic-inline-flow", |node, _, _| {
+                    InlineFlow::new(
+                        "atomic-inline-flow",
+                        node.attached_inline_flow_state()
+                            .cloned()
+                            .unwrap_or_default(),
+                        vec![
+                            InlineFlowItem::text("before "),
+                            InlineFlowItem::custom(
+                                "$x$",
+                                InlineMetrics::new(px(24.), px(14.), px(4.)),
+                                div()
+                                    .debug_selector(|| "atomic-inline-flow-item".into())
+                                    .w(px(24.))
+                                    .h(px(18.)),
+                            ),
+                            InlineFlowItem::text("\nafter"),
+                        ],
+                    )
+                });
+            let text_view = cx.new(|cx| TextViewState::markdown("probe", cx));
+            Self {
+                text_view,
+                extensions,
+            }
+        }
+    }
+
+    impl Render for AtomicInlineFlowTextViewTestRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(240.)).child(
+                TextView::new(&self.text_view)
+                    .markdown_extensions(self.extensions.clone())
+                    .selectable(true),
+            )
+        }
+    }
+
+    impl InlineFlowStyleTestRoot {
+        fn new() -> Self {
+            Self {
+                small_state: Default::default(),
+                large_state: Default::default(),
+            }
+        }
+    }
+
+    impl Render for InlineFlowStyleTestRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let items = || {
+                vec![
+                    crate::text::InlineFlowItem::text("inherited typography"),
+                    crate::text::InlineFlowItem::custom(
+                        "x",
+                        crate::text::InlineMetrics::new(px(1.), px(1.), px(0.)),
+                        div().w(px(1.)).h(px(1.)),
+                    ),
+                ]
+            };
+
+            crate::v_flex()
+                .child(
+                    div()
+                        .w(px(300.))
+                        .text_size(px(10.))
+                        .debug_selector(|| "inline-flow-small-style".into())
+                        .child(crate::text::InlineFlow::new(
+                            "small-flow",
+                            self.small_state.clone(),
+                            items(),
+                        )),
+                )
+                .child(
+                    div()
+                        .w(px(300.))
+                        .text_size(px(30.))
+                        .debug_selector(|| "inline-flow-large-style".into())
+                        .child(crate::text::InlineFlow::new(
+                            "large-flow",
+                            self.large_state.clone(),
+                            items(),
+                        )),
+                )
+        }
     }
 
     impl InlineImageTextViewTestRoot {
@@ -459,6 +570,125 @@ mod tests {
             inline_bounds[1].left() - inline_bounds[0].right() < px(40.),
             "unloaded inline image fallback should stay generic and compact"
         );
+    }
+
+    #[gpui::test]
+    fn inline_flow_measurement_uses_inherited_text_style(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let content = cx.new(|_| InlineFlowStyleTestRoot::new());
+            crate::Root::new(content, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let small = cx.debug_bounds("inline-flow-small-style").unwrap();
+        let large = cx.debug_bounds("inline-flow-large-style").unwrap();
+        assert!(
+            large.size.height > small.size.height * 2.,
+            "captured 30px typography should measure substantially taller than 10px: {small:?} vs {large:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn atomic_inline_flow_participates_in_drag_selection(cx: &mut TestAppContext) {
+        use crate::WindowExt as _;
+
+        cx.update(crate::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let content = cx.new(AtomicInlineFlowTextViewTestRoot::new);
+            crate::Root::new(content, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let atomic_bounds = cx.debug_bounds("atomic-inline-flow-item").unwrap();
+        let registered_bounds = cx.update(|window, cx| {
+            crate::Root::read(window, cx)
+                .selectable_text_inlines
+                .values()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            registered_bounds
+                .iter()
+                .any(|bounds| bounds.contains(&atomic_bounds.center())),
+            "atomic inline bounds were not registered for selection: {atomic_bounds:?} vs {registered_bounds:?}"
+        );
+
+        let right = point(atomic_bounds.right() - px(1.), atomic_bounds.center().y);
+        let left = point(atomic_bounds.left() + px(1.), atomic_bounds.center().y);
+        cx.simulate_mouse_down(right, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_move(left, Some(MouseButton::Left), Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let selected = cx.update(|window, cx| window.selected_text(cx));
+        assert_eq!(selected.trim(), "$x$");
+    }
+
+    #[gpui::test]
+    fn atomic_inline_flow_drag_preserves_hard_breaks(cx: &mut TestAppContext) {
+        use crate::WindowExt as _;
+
+        cx.update(crate::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let content = cx.new(AtomicInlineFlowTextViewTestRoot::new);
+            crate::Root::new(content, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let mut registered_bounds = cx.update(|window, cx| {
+            crate::Root::read(window, cx)
+                .selectable_text_inlines
+                .values()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+        });
+        registered_bounds.sort_by(|left, right| {
+            left.top()
+                .partial_cmp(&right.top())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    left.left()
+                        .partial_cmp(&right.left())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        assert_eq!(registered_bounds.len(), 3);
+
+        let first = registered_bounds[0];
+        let last = registered_bounds[2];
+        let drag_start = point(last.right() - px(1.), last.center().y);
+        let drag_end = point(first.left() + px(1.), first.center().y);
+        cx.simulate_mouse_down(drag_start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(drag_end, Some(MouseButton::Left), Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let selected = cx.update(|window, cx| window.selected_text(cx));
+        assert_eq!(selected.trim(), "before $x$\nafter");
     }
 
     #[gpui::test]
@@ -532,6 +762,18 @@ mod tests {
         cx.simulate_click(point(px(10.), px(34.)), Modifiers::default());
 
         assert_eq!(cx.opened_url(), None);
+    }
+
+    #[gpui::test]
+    fn visible_markdown_link_still_opens(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (_, cx) =
+            cx.add_window_view(|_, cx| TextViewTestRoot::new("[visible](https://example.com)", cx));
+        let cx: &mut VisualTestContext = cx;
+
+        cx.simulate_click(point(px(10.), px(10.)), Modifiers::default());
+
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
     }
 
     #[gpui::test]

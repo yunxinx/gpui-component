@@ -13,6 +13,8 @@ use markdown::{ParseOptions, mdast};
 
 use crate::text::node::Span;
 
+use super::inline_flow::InlineFlowState;
+
 static MARKDOWN_EXTENSIONS_REVISION: AtomicU64 = AtomicU64::new(1);
 
 /// Re-export of the Markdown AST types used by custom parsers.
@@ -86,6 +88,9 @@ pub struct MarkdownNode {
     text: SharedString,
     markdown: SharedString,
     data: Arc<dyn Any + Send + Sync>,
+    inline_flow_states: Vec<InlineFlowState>,
+    inline_flow_breaks_before: Option<Vec<usize>>,
+    heading_level: Option<u8>,
     pub(crate) span: Option<Span>,
 }
 
@@ -100,6 +105,9 @@ impl MarkdownNode {
             text: SharedString::default(),
             markdown: SharedString::default(),
             data: Arc::new(data),
+            inline_flow_states: Vec::new(),
+            inline_flow_breaks_before: None,
+            heading_level: None,
             span: None,
         }
     }
@@ -131,6 +139,69 @@ impl MarkdownNode {
         self
     }
 
+    /// Attach persistent selection state used by a custom mixed inline flow.
+    ///
+    /// This lets a block plugin reuse [`InlineFlow`](super::InlineFlow) without
+    /// teaching the Markdown parser about the plugin's renderer-specific data.
+    pub fn inline_flow_state(mut self, state: InlineFlowState) -> Self {
+        self.inline_flow_states = vec![state];
+        self.inline_flow_breaks_before = None;
+        self
+    }
+
+    /// Attach persistent selection states for a custom block that renders more
+    /// than one independent mixed inline flow.
+    pub fn inline_flow_states(mut self, states: impl IntoIterator<Item = InlineFlowState>) -> Self {
+        self.inline_flow_states = states.into_iter().collect();
+        self.inline_flow_breaks_before = None;
+        self
+    }
+
+    /// Attach ordered selection states and the exact number of logical line
+    /// breaks before each flow.
+    ///
+    /// Most custom blocks should use [`Self::inline_flow_states`], whose
+    /// selected fragments retain the historical single-newline separator.
+    /// This variant is for renderers that split one logical Markdown block
+    /// into several flows and must preserve consecutive hard breaks across
+    /// those renderer boundaries.
+    pub fn inline_flow_states_with_breaks(
+        mut self,
+        states: impl IntoIterator<Item = (InlineFlowState, usize)>,
+    ) -> Self {
+        let (states, breaks_before): (Vec<_>, Vec<_>) = states.into_iter().unzip();
+        self.inline_flow_states = states;
+        self.inline_flow_breaks_before = Some(breaks_before);
+        self
+    }
+
+    /// Mark this custom block as a replacement for a native Markdown heading.
+    ///
+    /// The TextView block renderer will apply its native heading typography and
+    /// spacing around the plugin element.
+    pub fn heading(mut self, level: u8) -> Self {
+        self.heading_level = Some(level);
+        self
+    }
+
+    /// Selection state attached by [`Self::inline_flow_state`].
+    pub fn attached_inline_flow_state(&self) -> Option<&InlineFlowState> {
+        self.inline_flow_states.first()
+    }
+
+    /// Selection states attached by [`Self::inline_flow_states`].
+    pub fn attached_inline_flow_states(&self) -> &[InlineFlowState] {
+        &self.inline_flow_states
+    }
+
+    pub(crate) fn attached_inline_flow_breaks_before(&self) -> Option<&[usize]> {
+        self.inline_flow_breaks_before.as_deref()
+    }
+
+    pub(crate) fn heading_level(&self) -> Option<u8> {
+        self.heading_level
+    }
+
     /// Read typed data.
     pub fn data<T>(&self) -> Option<&T>
     where
@@ -158,6 +229,9 @@ impl fmt::Debug for MarkdownNode {
             .field("name", &self.name)
             .field("text", &self.text)
             .field("markdown", &self.markdown)
+            .field("inline_flow_state_count", &self.inline_flow_states.len())
+            .field("inline_flow_breaks_before", &self.inline_flow_breaks_before)
+            .field("heading_level", &self.heading_level)
             .field("span", &self.span)
             .finish_non_exhaustive()
     }
@@ -168,6 +242,8 @@ impl PartialEq for MarkdownNode {
         self.name == other.name
             && self.text == other.text
             && self.markdown == other.markdown
+            && self.inline_flow_breaks_before == other.inline_flow_breaks_before
+            && self.heading_level == other.heading_level
             && self.span == other.span
     }
 }
@@ -301,5 +377,28 @@ impl MarkdownExtensions {
 
     fn bump_revision(&mut self) {
         self.revision = MARKDOWN_EXTENSIONS_REVISION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_node_mixed_flow_builders_preserve_default_and_exact_break_modes() {
+        let default = MarkdownNode::new("default-flow", ())
+            .inline_flow_states([InlineFlowState::default(), InlineFlowState::default()]);
+        assert_eq!(default.attached_inline_flow_states().len(), 2);
+        assert_eq!(default.attached_inline_flow_breaks_before(), None);
+
+        let exact = MarkdownNode::new("exact-flow", ()).inline_flow_states_with_breaks([
+            (InlineFlowState::default(), 0),
+            (InlineFlowState::default(), 2),
+        ]);
+        assert_eq!(exact.attached_inline_flow_states().len(), 2);
+        assert_eq!(
+            exact.attached_inline_flow_breaks_before(),
+            Some(&[0, 2][..])
+        );
     }
 }
