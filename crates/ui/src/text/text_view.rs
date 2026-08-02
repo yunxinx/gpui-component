@@ -413,12 +413,13 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use crate::ActiveTheme as _;
     use crate::text::{
         InlineFlow, InlineFlowItem, InlineMetrics, MarkdownExtensions, MarkdownInline,
-        MarkdownNode, TextViewState,
+        MarkdownNode, TextViewFormat, TextViewState, TextViewStyle,
     };
     use gpui::{
-        AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
+        AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
         Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, Render,
         Styled as _, TestAppContext, VisualTestContext, Window, div, point, px,
     };
@@ -427,12 +428,67 @@ mod tests {
         text_view: Entity<TextViewState>,
     }
 
+    struct TextViewBuilderTestRoot;
+
     struct DummyTextViewPlugin;
 
     impl TextViewPlugin for DummyTextViewPlugin {
         fn setup(self, mut text_view: TextView) -> TextView {
             text_view.selectable = true;
             text_view
+        }
+    }
+
+    fn text_view_builder_fixture() -> TextView {
+        TextView::markdown("builder", "---\n\nab $x$")
+            .style(TextViewStyle::default())
+            .selectable(true)
+            .scrollable(true)
+            .code_block_actions(|_, _, _| div())
+            .markdown_mdx()
+            .markdown_parse_options(|options| options.constructs.math_text = true)
+            .markdown_prepare_source(|source| source.replace("ab", "cd"))
+            .markdown_block_parser(|node, cx| {
+                let markdown::mdast::Node::ThematicBreak(_) = node else {
+                    return None;
+                };
+                Some(
+                    MarkdownNode::new("builder-block", ())
+                        .text(cx.node_source(node).unwrap_or_default()),
+                )
+            })
+            .markdown_block_renderer("builder-block", |_, _, _| {
+                div()
+                    .debug_selector(|| "text-view-builder-block".into())
+                    .size(px(8.))
+            })
+            .markdown_inline_parser(|node, cx| {
+                let markdown::mdast::Node::InlineMath(_) = node else {
+                    return None;
+                };
+                Some(
+                    MarkdownNode::new("builder-inline", ())
+                        .text(cx.node_source(node).unwrap_or_default()),
+                )
+            })
+            .markdown_inline_renderer("builder-inline", |_, _, _, _| {
+                Some(MarkdownInline::new(
+                    InlineMetrics::new(px(12.), px(8.), px(2.)),
+                    div()
+                        .debug_selector(|| "text-view-builder-inline".into())
+                        .w(px(12.))
+                        .h(px(10.)),
+                ))
+            })
+            .plugin(DummyTextViewPlugin)
+    }
+
+    impl Render for TextViewBuilderTestRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(300.))
+                .h(px(200.))
+                .child(text_view_builder_fixture())
         }
     }
 
@@ -480,6 +536,7 @@ mod tests {
         bold: bool,
         link: Option<String>,
         source_range: Range<usize>,
+        color: Hsla,
     }
 
     struct MarkdownInlinePluginTestRoot {
@@ -525,7 +582,8 @@ mod tests {
                                     .debug_selector(|| "atomic-inline-flow-item".into())
                                     .w(px(24.))
                                     .h(px(18.)),
-                            ),
+                            )
+                            .custom_link("https://example.com/formula"),
                             InlineFlowItem::text("\nafter"),
                         ],
                     )
@@ -681,7 +739,7 @@ mod tests {
     fn markdown_inline_renderer_receives_native_heading_mark_link_and_range(
         cx: &mut TestAppContext,
     ) {
-        const SOURCE: &str = "# before **[$x$](https://example.com)** after";
+        const SOURCE: &str = "# before **[$x$](https://example.com)** after\n\n> quoted $y$";
 
         cx.update(crate::init);
         let snapshots = Arc::new(Mutex::new(Vec::<InlineRenderSnapshot>::new()));
@@ -703,6 +761,7 @@ mod tests {
                         bold: context.mark().bold,
                         link: context.link().map(|link| link.url.to_string()),
                         source_range: context.source_range(),
+                        color: context.text_style().color,
                     });
                 }
                 Some(MarkdownInline::new(
@@ -729,15 +788,27 @@ mod tests {
         });
 
         assert!(cx.debug_bounds("markdown-inline-plugin-item").is_some());
+        let muted_foreground = cx.update(|_, cx| cx.theme().muted_foreground);
         let snapshots = snapshots.lock().unwrap();
-        let snapshot = snapshots.last().expect("inline renderer should run");
-        let start = SOURCE.find("$x$").unwrap();
-        assert_eq!(snapshot.heading_level, Some(1));
-        assert_eq!(snapshot.font_size, px(28.).into());
-        assert_eq!(snapshot.font_weight, FontWeight::BOLD);
-        assert!(snapshot.bold);
-        assert_eq!(snapshot.link.as_deref(), Some("https://example.com"));
-        assert_eq!(snapshot.source_range, start..start + 3);
+        let heading_start = SOURCE.find("$x$").unwrap();
+        let heading = snapshots
+            .iter()
+            .find(|snapshot| snapshot.source_range.start == heading_start)
+            .expect("heading inline renderer should run");
+        assert_eq!(heading.heading_level, Some(1));
+        assert_eq!(heading.font_size, px(28.).into());
+        assert_eq!(heading.font_weight, FontWeight::BOLD);
+        assert!(heading.bold);
+        assert_eq!(heading.link.as_deref(), Some("https://example.com"));
+        assert_eq!(heading.source_range, heading_start..heading_start + 3);
+
+        let quote_start = SOURCE.find("$y$").unwrap();
+        let quote = snapshots
+            .iter()
+            .find(|snapshot| snapshot.source_range.start == quote_start)
+            .expect("blockquote inline renderer should run");
+        assert_eq!(quote.heading_level, None);
+        assert_eq!(quote.color, muted_foreground);
     }
 
     #[gpui::test]
@@ -821,6 +892,41 @@ mod tests {
 
         let selected = cx.update(|window, cx| window.selected_text(cx));
         assert_eq!(selected.trim(), "$x$");
+
+        cx.simulate_mouse_up(left, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            cx.opened_url(),
+            None,
+            "a reverse drag selection must not activate the custom link"
+        );
+
+        cx.simulate_mouse_down(left, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_move(right, Some(MouseButton::Left), Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let selected = cx.update(|window, cx| window.selected_text(cx));
+        assert_eq!(selected.trim(), "$x$");
+        cx.simulate_mouse_up(right, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            cx.opened_url(),
+            None,
+            "a forward drag selection must not activate the custom link"
+        );
+
+        cx.update(|window, cx| {
+            window.end_text_selection(cx);
+            let _ = window.draw(cx);
+        });
+        cx.simulate_click(atomic_bounds.center(), Modifiers::default());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://example.com/formula")
+        );
     }
 
     #[gpui::test]
@@ -931,6 +1037,41 @@ mod tests {
         let view = TextView::markdown("plugin-test", "").plugin(DummyTextViewPlugin);
 
         assert!(view.selectable);
+    }
+
+    #[gpui::test]
+    fn test_text_view_builder(cx: &mut TestAppContext) {
+        let view = text_view_builder_fixture();
+
+        assert!(view.format == Some(TextViewFormat::Markdown));
+        assert_eq!(view.text.as_deref(), Some("---\n\nab $x$"));
+        assert!(view.state.is_none());
+        assert!(view.selectable);
+        assert!(view.scrollable);
+        assert!(view.code_block_actions.is_some());
+
+        let options = view.markdown_extensions.configured_parse_options();
+        assert!(options.constructs.mdx_expression_text);
+        assert!(options.constructs.math_text);
+        assert_eq!(
+            view.markdown_extensions.prepared_source("ab").unwrap(),
+            "cd"
+        );
+        assert_ne!(view.markdown_extensions.revision(), 0);
+
+        cx.update(crate::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let content = cx.new(|_| TextViewBuilderTestRoot);
+            crate::Root::new(content, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(cx.debug_bounds("text-view-builder-block").is_some());
+        assert!(cx.debug_bounds("text-view-builder-inline").is_some());
     }
 
     #[gpui::test]

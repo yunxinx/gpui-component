@@ -755,6 +755,34 @@ mod tests {
         }
     }
 
+    struct DummyLegacyInlinePlugin;
+
+    impl MarkdownPlugin for DummyLegacyInlinePlugin {
+        fn name(&self) -> &str {
+            "legacy-inline"
+        }
+
+        fn parse(
+            &self,
+            node: &mdast::Node,
+            _cx: &MarkdownParseContext<'_>,
+        ) -> Option<MarkdownNode> {
+            let mdast::Node::Text(text) = node else {
+                return None;
+            };
+            Some(MarkdownNode::new(self.name(), ()).text(text.value.clone()))
+        }
+
+        fn render(
+            &self,
+            _node: &MarkdownNode,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> impl IntoElement {
+            gpui::div()
+        }
+    }
+
     #[test]
     fn markdown_extensions_builder_configures_all_extension_stages() {
         let extensions = MarkdownExtensions::default()
@@ -784,6 +812,30 @@ mod tests {
                 .inline_renderers
                 .contains_key("dummy-inline")
         );
+    }
+
+    #[test]
+    fn legacy_inline_plugin_uses_selectable_fallback_without_block_renderer() {
+        let source = "legacy";
+        let extensions = MarkdownExtensions::default().plugin(DummyLegacyInlinePlugin);
+        let ast = markdown::to_mdast(source, &ParseOptions::gfm()).unwrap();
+        let mdast::Node::Root(root) = ast else {
+            panic!("expected root");
+        };
+        let mdast::Node::Paragraph(paragraph) = &root.children[0] else {
+            panic!("expected paragraph");
+        };
+        let context = MarkdownParseContext::new(source, source, 0);
+        let node = extensions
+            .parse_inline(&paragraph.children[0], &context)
+            .expect("legacy inline parser should remain usable");
+
+        assert_eq!(node.name(), "legacy-inline");
+        assert_eq!(node.as_text(), "legacy");
+        assert_eq!(extensions.inline_parsers.len(), 1);
+        assert!(extensions.inline_renderers.is_empty());
+        assert!(extensions.block_parsers.is_empty());
+        assert!(extensions.block_renderers.is_empty());
     }
 
     #[test]

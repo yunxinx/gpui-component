@@ -1,5 +1,5 @@
 use gpui::{
-    App, InteractiveElement as _, IntoElement, ListState, ParentElement as _, SharedString,
+    App, Hsla, InteractiveElement as _, IntoElement, ListState, ParentElement as _, SharedString,
     Styled as _, Window, div,
 };
 
@@ -20,6 +20,7 @@ pub(crate) struct NodeRenderOptions {
     pub(crate) ordered: bool,
     pub(crate) depth: usize,
     pub(crate) is_last: bool,
+    pub(crate) text_color: Option<Hsla>,
 }
 
 impl NodeRenderOptions {

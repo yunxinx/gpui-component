@@ -959,6 +959,7 @@ impl Paragraph {
         &self,
         node_cx: &NodeContext,
         heading_level: Option<u8>,
+        text_color: Option<Hsla>,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
@@ -969,7 +970,7 @@ impl Paragraph {
             return InlineFlow::new(
                 span.unwrap_or_default(),
                 self.flow_state.clone(),
-                self.inline_flow_items(node_cx, heading_level, window, cx),
+                self.inline_flow_items(node_cx, heading_level, text_color, window, cx),
             )
             .into_any_element();
         }
@@ -1109,6 +1110,7 @@ impl Paragraph {
         &self,
         node_cx: &NodeContext,
         heading_level: Option<u8>,
+        text_color: Option<Hsla>,
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<InlineFlowItem> {
@@ -1149,6 +1151,9 @@ impl Paragraph {
                 if let Some(heading) = heading_style {
                     text_style.font_size = heading.font_size.into();
                     text_style.font_weight = heading.font_weight;
+                }
+                if let Some(text_color) = text_color {
+                    text_style.color = text_color;
                 }
                 text_style = text_style.highlight(highlight);
 
@@ -1718,7 +1723,10 @@ impl BlockNode {
                             this.border_r_1().border_color(cx.theme().border)
                         })
                         .refine_style(&style.table_cell)
-                        .child(cell.children.render(node_cx, None, window, cx)),
+                        .child(
+                            cell.children
+                                .render(node_cx, None, options.text_color, window, cx),
+                        ),
                 );
             }
             rows.push(
@@ -1802,7 +1810,10 @@ impl BlockNode {
                             this.border_r_1().border_color(cx.theme().border)
                         })
                         .refine_style(&style.table_cell)
-                        .child(cell.children.render(node_cx, None, window, cx)),
+                        .child(
+                            cell.children
+                                .render(node_cx, None, options.text_color, window, cx),
+                        ),
                 );
             }
 
@@ -1859,7 +1870,7 @@ impl BlockNode {
             BlockNode::Paragraph(paragraph) => div()
                 .id(("p", ix))
                 .pb(mb)
-                .child(paragraph.render(node_cx, None, window, cx))
+                .child(paragraph.render(node_cx, None, options.text_color, window, cx))
                 .into_any_element(),
             BlockNode::Heading {
                 level, children, ..
@@ -1872,29 +1883,40 @@ impl BlockNode {
                     .whitespace_normal()
                     .text_size(heading.font_size)
                     .font_weight(heading.font_weight)
-                    .child(children.render(node_cx, Some(*level), window, cx))
+                    .child(children.render(node_cx, Some(*level), options.text_color, window, cx))
                     .into_any_element()
             }
-            BlockNode::Blockquote { children, .. } => div()
-                .w_full()
-                .pb(mb)
-                .child(
-                    div()
-                        .id(("blockquote", ix))
-                        .w_full()
-                        .text_color(cx.theme().muted_foreground)
-                        .border_l_3()
-                        .border_color(cx.theme().secondary_active)
-                        .px_4()
-                        .children({
-                            let children_len = children.len();
-                            children.into_iter().enumerate().map(move |(index, c)| {
-                                let is_last = index == children_len - 1;
-                                c.render_block(options.is_last(is_last), node_cx, window, cx)
-                            })
-                        }),
-                )
-                .into_any_element(),
+            BlockNode::Blockquote { children, .. } => {
+                let text_color = cx.theme().muted_foreground;
+                div()
+                    .w_full()
+                    .pb(mb)
+                    .child(
+                        div()
+                            .id(("blockquote", ix))
+                            .w_full()
+                            .text_color(text_color)
+                            .border_l_3()
+                            .border_color(cx.theme().secondary_active)
+                            .px_4()
+                            .children({
+                                let children_len = children.len();
+                                children.into_iter().enumerate().map(move |(index, c)| {
+                                    let is_last = index == children_len - 1;
+                                    c.render_block(
+                                        NodeRenderOptions {
+                                            text_color: Some(text_color),
+                                            ..options.is_last(is_last)
+                                        },
+                                        node_cx,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                            }),
+                    )
+                    .into_any_element()
+            }
             BlockNode::List {
                 children, ordered, ..
             } => v_flex()

@@ -503,6 +503,10 @@ struct UpdateFuture {
     /// from the last successfully parsed document so an append can recover by
     /// reparsing the full source after an earlier parse error.
     source: String,
+    /// Whether `content` was successfully parsed from the current source and
+    /// Markdown extensions. Source equality alone is insufficient because an
+    /// extension-only replacement can fail while keeping the same raw text.
+    content_is_current: bool,
     rx: Pin<Box<Receiver<UpdateOptions>>>,
     tx_result: Sender<ParsedUpdate>,
 }
@@ -517,6 +521,7 @@ impl UpdateFuture {
             format,
             content: Default::default(),
             source: String::new(),
+            content_is_current: true,
             rx: Box::pin(rx),
             tx_result,
         }
@@ -535,7 +540,9 @@ impl UpdateFuture {
         // document represents the exact source preceding this append. If a
         // replacement failed to parse, keep its raw source and recover with a
         // full parse once a later append makes the document valid.
-        let can_append = options.append && self.content.document.source.as_ref() == previous_source;
+        let can_append = options.append
+            && self.content_is_current
+            && self.content.document.source.as_ref() == previous_source;
         let effective_options = if can_append {
             options.clone()
         } else {
@@ -565,6 +572,9 @@ impl Future for UpdateFuture {
                     let res = self.parse(&options);
                     if let Ok(content) = &res {
                         self.content = content.clone();
+                        self.content_is_current = true;
+                    } else {
+                        self.content_is_current = false;
                     }
                     if options.publish_result {
                         _ = self.tx_result.try_send(ParsedUpdate {
@@ -770,6 +780,69 @@ mod tests {
         ));
         let parsed_update = rx_result.try_recv().expect("next parse result");
         assert_eq!(parsed_update.revision, total_updates);
+    }
+
+    #[test]
+    fn failed_same_source_replacement_forces_full_parse_before_append() {
+        let (tx, rx) = unbounded::<UpdateOptions>();
+        let (tx_result, rx_result) = unbounded::<ParsedUpdate>();
+        let mut future = Box::pin(UpdateFuture::new(TextViewFormat::Markdown, rx, tx_result));
+        let waker = futures::task::noop_waker();
+        let mut task_cx = std::task::Context::from_waker(&waker);
+        let source = "first block\n\nlast block";
+
+        tx.try_send(UpdateOptions {
+            revision: 1,
+            pending_text: source.to_string(),
+            append: false,
+            markdown_extensions: Arc::default(),
+            publish_result: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            std::future::Future::poll(future.as_mut(), &mut task_cx),
+            Poll::Pending
+        ));
+
+        let invalid_extensions = Arc::new(MarkdownExtensions::default().prepare_source(|source| {
+            if source.contains("first block") {
+                format!("{source}!")
+            } else {
+                source.to_string()
+            }
+        }));
+        tx.try_send(UpdateOptions {
+            revision: 2,
+            pending_text: source.to_string(),
+            append: false,
+            markdown_extensions: invalid_extensions.clone(),
+            publish_result: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            std::future::Future::poll(future.as_mut(), &mut task_cx),
+            Poll::Pending
+        ));
+
+        tx.try_send(UpdateOptions {
+            revision: 3,
+            pending_text: " tail".to_string(),
+            append: true,
+            markdown_extensions: invalid_extensions,
+            publish_result: true,
+        })
+        .unwrap();
+        assert!(matches!(
+            std::future::Future::poll(future.as_mut(), &mut task_cx),
+            Poll::Pending
+        ));
+
+        let parsed_update = rx_result.try_recv().expect("append parse result");
+        assert_eq!(parsed_update.revision, 3);
+        assert!(
+            parsed_update.result.is_err(),
+            "append reused content from an extension revision whose replacement failed"
+        );
     }
 
     #[gpui::test]
