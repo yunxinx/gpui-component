@@ -147,6 +147,13 @@ ComboBox:
     zh-HK: "暫無數據"
     zh-TW: "沒有結果"
     it: "Nessun risultato"
+TextView:
+  failed_to_parse:
+    en: Failed to parse content
+    zh-CN: 无法解析内容
+    zh-HK: 無法解析內容
+    zh-TW: 無法解析內容
+    it: Impossibile analizzare il contenuto
 Dock:
   Unnamed:
     en: Unnamed

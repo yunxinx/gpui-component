@@ -21,7 +21,7 @@ use crate::{global_state::GlobalState, text::TextViewStyle};
 pub(crate) type CodeBlockActionsFn =
     dyn Fn(&CodeBlock, &mut Window, &mut App) -> AnyElement + Send + Sync;
 
-/// A text view that can render Markdown or HTML.
+/// A text view that can render plain text, Markdown, or HTML.
 ///
 /// ## Goals
 ///
@@ -84,6 +84,22 @@ impl TextView {
             text: None,
             text_view_style: TextViewStyle::default(),
             style: StyleRefinement::default(),
+            selectable: false,
+            scrollable: false,
+            code_block_actions: None,
+            markdown_extensions: Arc::default(),
+        }
+    }
+
+    /// Create a new plain-text view.
+    pub fn plain(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Self {
+        Self {
+            id: id.into(),
+            format: Some(TextViewFormat::Plain),
+            text: Some(text.into()),
+            text_view_style: TextViewStyle::default(),
+            style: StyleRefinement::default(),
+            state: None,
             selectable: false,
             scrollable: false,
             code_block_actions: None,
@@ -234,6 +250,17 @@ impl TextView {
         self
     }
 
+    /// Register a fallible length-preserving source preparation step.
+    pub fn markdown_try_prepare_source<F, E>(mut self, prepare: F) -> Self
+    where
+        F: Fn(&str) -> Result<String, E> + Send + Sync + 'static,
+        E: Into<SharedString>,
+    {
+        Arc::make_mut(&mut self.markdown_extensions)
+            .push_try_source_preparer(move |source| prepare(source).map_err(Into::into));
+        self
+    }
+
     /// Register a custom inline-level Markdown parser.
     pub fn markdown_inline_parser<F>(mut self, parser: F) -> Self
     where
@@ -316,12 +343,10 @@ impl Element for TextView {
             let state = window.use_keyed_state(
                 SharedString::from(format!("{}/state", self.id)),
                 cx,
-                move |_, cx| {
-                    if default_format == TextViewFormat::Markdown {
-                        TextViewState::markdown(default_text.as_str(), cx)
-                    } else {
-                        TextViewState::html(default_text.as_str(), cx)
-                    }
+                move |_, cx| match default_format {
+                    TextViewFormat::Plain => TextViewState::plain(default_text.as_str(), cx),
+                    TextViewFormat::Markdown => TextViewState::markdown(default_text.as_str(), cx),
+                    TextViewFormat::Html => TextViewState::html(default_text.as_str(), cx),
                 },
             );
             self.state = Some(state.clone());
@@ -351,8 +376,7 @@ impl Element for TextView {
             })
             .relative()
             .on_action(move |_: &crate::input::Copy, window, cx| {
-                use crate::WindowExt as _;
-                let text = window.selected_text(cx).trim().to_string();
+                let text = crate::Root::read(window, cx).window_selected_text_for_copy(cx);
                 if text.is_empty() {
                     cx.propagate();
                     return;
@@ -448,6 +472,7 @@ mod tests {
             .markdown_mdx()
             .markdown_parse_options(|options| options.constructs.math_text = true)
             .markdown_prepare_source(|source| source.replace("ab", "cd"))
+            .markdown_try_prepare_source(|source| Ok::<_, &'static str>(source.replace("cd", "ef")))
             .markdown_block_parser(|node, cx| {
                 let markdown::mdast::Node::ThematicBreak(_) = node else {
                     return None;
@@ -1042,6 +1067,8 @@ mod tests {
     #[gpui::test]
     fn test_text_view_builder(cx: &mut TestAppContext) {
         let view = text_view_builder_fixture();
+        let plain = TextView::plain("plain-builder", "**literal**").selectable(true);
+        let plain_helper = crate::text::plain("<literal>");
 
         assert!(view.format == Some(TextViewFormat::Markdown));
         assert_eq!(view.text.as_deref(), Some("---\n\nab $x$"));
@@ -1049,13 +1076,18 @@ mod tests {
         assert!(view.selectable);
         assert!(view.scrollable);
         assert!(view.code_block_actions.is_some());
+        assert!(plain.format == Some(TextViewFormat::Plain));
+        assert_eq!(plain.text.as_deref(), Some("**literal**"));
+        assert!(plain.selectable);
+        assert!(plain_helper.format == Some(TextViewFormat::Plain));
+        assert_eq!(plain_helper.text.as_deref(), Some("<literal>"));
 
         let options = view.markdown_extensions.configured_parse_options();
         assert!(options.constructs.mdx_expression_text);
         assert!(options.constructs.math_text);
         assert_eq!(
             view.markdown_extensions.prepared_source("ab").unwrap(),
-            "cd"
+            "ef"
         );
         assert_ne!(view.markdown_extensions.revision(), 0);
 
@@ -1072,6 +1104,35 @@ mod tests {
 
         assert!(cx.debug_bounds("text-view-builder-block").is_some());
         assert!(cx.debug_bounds("text-view-builder-inline").is_some());
+    }
+
+    #[gpui::test]
+    fn plain_text_copy_preserves_source_boundaries(cx: &mut TestAppContext) {
+        const SOURCE: &str = "  **literal**\n";
+
+        cx.update(crate::init);
+        let text_view = cx.update(|cx| cx.new(|cx| TextViewState::plain(SOURCE, cx)));
+        let focus_handle = text_view.read_with(cx, |state, _| state.focus_handle.clone());
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let content = cx.new(|_| TextViewTestRoot {
+                text_view: text_view.clone(),
+            });
+            crate::Root::new(content, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            focus_handle.focus(window, cx);
+        });
+        text_view.update(cx, |state, cx| state.select_all(cx));
+        cx.dispatch_action(crate::input::Copy);
+
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(SOURCE.to_string())
+        );
     }
 
     #[gpui::test]

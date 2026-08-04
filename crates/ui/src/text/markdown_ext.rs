@@ -2,6 +2,7 @@ use std::{
     any::Any,
     collections::HashMap,
     fmt,
+    ops::Range,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -39,8 +40,30 @@ pub type MarkdownBlockRenderFn =
 /// Type for configuring the Markdown parser options used by TextView.
 pub type MarkdownParseOptionsFn = dyn Fn(&mut ParseOptions) + Send + Sync;
 
-/// Type for preparing a length-preserving parse view of Markdown source.
+/// Type for preparing a length-preserving Markdown parse view.
+///
+/// Incremental parsing may include synthetic retained definitions in this
+/// input so context-sensitive preparation preserves reference resolution. The
+/// authoritative source exposed by parse contexts and TextView remains the
+/// real document fragment. The callback may rewrite any bytes permitted by the
+/// length/character-boundary contract; TextView restores its private boundary
+/// and falls back to a full authoritative parse if the synthetic definitions
+/// can no longer be reconstructed unambiguously.
 pub type MarkdownSourcePreparerFn = dyn Fn(&str) -> String + Send + Sync;
+
+/// Type for a fallible length-preserving Markdown source preparer.
+///
+/// Returning an error aborts parsing before an unsafe parse view can be
+/// published. Infallible integrations can continue to use
+/// [`MarkdownSourcePreparerFn`].
+pub type MarkdownTrySourcePreparerFn = dyn Fn(&str) -> Result<String, SharedString> + Send + Sync;
+
+/// Type for formatting a Markdown parse diagnostic for display.
+///
+/// Unlike source preparers, this callback is invoked only from TextView's UI
+/// render pass. Applications can therefore keep parser errors as stable
+/// diagnostic codes and resolve the current locale here.
+pub type MarkdownParseErrorFormatterFn = dyn Fn(&str) -> SharedString + Send + Sync;
 
 /// Type for a custom Markdown inline parser.
 ///
@@ -105,14 +128,31 @@ pub struct MarkdownParseContext<'a> {
     source: &'a str,
     prepared_source: &'a str,
     offset: usize,
+    authoritative_image_alts: Option<&'a HashMap<Range<usize>, SharedString>>,
 }
 
 impl<'a> MarkdownParseContext<'a> {
+    #[cfg(test)]
     pub(crate) fn new(source: &'a str, prepared_source: &'a str, offset: usize) -> Self {
         Self {
             source,
             prepared_source,
             offset,
+            authoritative_image_alts: None,
+        }
+    }
+
+    pub(crate) fn with_authoritative_image_alts(
+        source: &'a str,
+        prepared_source: &'a str,
+        offset: usize,
+        authoritative_image_alts: &'a HashMap<Range<usize>, SharedString>,
+    ) -> Self {
+        Self {
+            source,
+            prepared_source,
+            offset,
+            authoritative_image_alts: Some(authoritative_image_alts),
         }
     }
 
@@ -149,6 +189,12 @@ impl<'a> MarkdownParseContext<'a> {
     pub fn node_range(&self, node: &mdast::Node) -> Option<std::ops::Range<usize>> {
         let position = node.position()?;
         Some(self.offset + position.start.offset..self.offset + position.end.offset)
+    }
+
+    pub(crate) fn authoritative_image_alt(&self, node: &mdast::Node) -> Option<&SharedString> {
+        let position = node.position()?;
+        self.authoritative_image_alts?
+            .get(&(position.start.offset..position.end.offset))
     }
 }
 
@@ -419,8 +465,10 @@ impl PartialEq for MarkdownNode {
 #[derive(Clone, Default)]
 pub struct MarkdownExtensions {
     enable_mdx: bool,
+    enable_cjk_emphasis_compatibility: bool,
     parse_options_configurers: Vec<Arc<MarkdownParseOptionsFn>>,
-    source_preparers: Vec<Arc<MarkdownSourcePreparerFn>>,
+    source_preparers: Vec<Arc<MarkdownTrySourcePreparerFn>>,
+    parse_error_formatter: Option<Arc<MarkdownParseErrorFormatterFn>>,
     block_parsers: Vec<Arc<MarkdownBlockParserFn>>,
     block_renderers: HashMap<SharedString, Arc<MarkdownBlockRenderFn>>,
     inline_parsers: Vec<Arc<MarkdownInlineParserFn>>,
@@ -429,6 +477,22 @@ pub struct MarkdownExtensions {
 }
 
 impl MarkdownExtensions {
+    /// Accept emphasis next to CJK punctuation where CommonMark's flanking
+    /// rules would otherwise leave the markers literal.
+    ///
+    /// CommonMark intentionally treats punctuation-delimited intraword
+    /// emphasis conservatively, so model output such as
+    /// `一次**“强调内容”**说明` and `**H01M（电池）**1,560件` remain literal by
+    /// default. This opt-in keeps the strict default while recognizing only
+    /// those narrow opening- and closing-punctuation patterns for `*` and
+    /// `**`. Underscore emphasis, other punctuation, escaped markers, code,
+    /// HTML, and link destinations retain the parser's native semantics.
+    pub fn cjk_emphasis_compatibility(mut self) -> Self {
+        self.enable_cjk_emphasis_compatibility = true;
+        self.bump_revision();
+        self
+    }
+
     /// Enable MDX JSX/expression constructs.
     ///
     /// This disables raw HTML constructs because `markdown-rs` gives HTML
@@ -453,11 +517,46 @@ impl MarkdownExtensions {
     /// The returned parse view must have the same UTF-8 byte length and
     /// character-boundary offsets as its input. TextView retains the original
     /// source for selection, copying, node ranges, and incremental updates.
+    /// During an incremental parse, the input may include synthetic definitions
+    /// retained from earlier blocks so reference-aware preparation sees the
+    /// same document context as markdown-rs. Rewriting their structure is
+    /// supported: an incremental reconstruction that becomes ambiguous is
+    /// discarded and retried against the full authoritative source.
     pub fn prepare_source<F>(mut self, prepare: F) -> Self
     where
         F: Fn(&str) -> String + Send + Sync + 'static,
     {
         self.push_source_preparer(prepare);
+        self
+    }
+
+    /// Register a fallible source preparation step that runs before mdast parsing.
+    ///
+    /// This has the same length and character-boundary contract as
+    /// [`Self::prepare_source`]. Returning an error aborts parsing rather than
+    /// publishing a parse view whose semantic invariants could not be proven.
+    pub fn try_prepare_source<F, E>(mut self, prepare: F) -> Self
+    where
+        F: Fn(&str) -> Result<String, E> + Send + Sync + 'static,
+        E: Into<SharedString>,
+    {
+        self.push_try_source_preparer(move |source| prepare(source).map_err(Into::into));
+        self
+    }
+
+    /// Format parse diagnostics at the UI boundary.
+    ///
+    /// Parsing and source preparation may run on a background task, so those
+    /// callbacks should return stable, locale-independent diagnostics. This
+    /// formatter runs during rendering and may resolve the application's
+    /// current locale. Unconfigured TextViews display the original diagnostic.
+    pub fn parse_error_formatter<F, E>(mut self, formatter: F) -> Self
+    where
+        F: Fn(&str) -> E + Send + Sync + 'static,
+        E: Into<SharedString>,
+    {
+        self.parse_error_formatter = Some(Arc::new(move |error| formatter(error).into()));
+        self.bump_revision();
         self
     }
 
@@ -579,6 +678,13 @@ impl MarkdownExtensions {
     where
         F: Fn(&str) -> String + Send + Sync + 'static,
     {
+        self.push_try_source_preparer(move |source| Ok(prepare(source)));
+    }
+
+    pub(crate) fn push_try_source_preparer<F>(&mut self, prepare: F)
+    where
+        F: Fn(&str) -> Result<String, SharedString> + Send + Sync + 'static,
+    {
         self.source_preparers.push(Arc::new(prepare));
         self.bump_revision();
     }
@@ -639,10 +745,14 @@ impl MarkdownExtensions {
         options
     }
 
+    pub(crate) fn cjk_emphasis_compatibility_enabled(&self) -> bool {
+        self.enable_cjk_emphasis_compatibility
+    }
+
     pub(crate) fn prepared_source(&self, source: &str) -> Result<String, SharedString> {
         let mut prepared = source.to_string();
         for prepare in &self.source_preparers {
-            let next = prepare(&prepared);
+            let next = prepare(&prepared)?;
             if next.len() != prepared.len() {
                 return Err(format!(
                     "Markdown source preparation must preserve the same UTF-8 byte length (expected {}, got {})",
@@ -669,6 +779,12 @@ impl MarkdownExtensions {
             prepared = next;
         }
         Ok(prepared)
+    }
+
+    pub(crate) fn format_parse_error(&self, error: &str) -> SharedString {
+        self.parse_error_formatter
+            .as_ref()
+            .map_or_else(|| error.to_string().into(), |formatter| formatter(error))
     }
 
     pub(crate) fn parse_block(
@@ -786,9 +902,12 @@ mod tests {
     #[test]
     fn markdown_extensions_builder_configures_all_extension_stages() {
         let extensions = MarkdownExtensions::default()
+            .cjk_emphasis_compatibility()
             .mdx()
             .parse_options(|options| options.constructs.math_text = true)
             .prepare_source(|source| source.replace("ab", "cd"))
+            .try_prepare_source(|source| Ok::<_, SharedString>(source.replace("cd", "ef")))
+            .parse_error_formatter(|error| format!("localized: {error}"))
             .block_parser(|_, _| None)
             .block_renderer("block", |_, _, _| gpui::div())
             .inline_parser(|_, _| None)
@@ -796,14 +915,26 @@ mod tests {
 
         let options = extensions.configured_parse_options();
         assert!(options.constructs.math_text);
+        assert!(extensions.cjk_emphasis_compatibility_enabled());
         assert!(options.constructs.mdx_expression_text);
         assert!(!options.constructs.html_text);
-        assert_eq!(extensions.prepared_source("ab").unwrap(), "cd");
+        assert_eq!(extensions.prepared_source("ab").unwrap(), "ef");
+        assert_eq!(
+            extensions.format_parse_error("preparation-code"),
+            "localized: preparation-code"
+        );
         assert_eq!(extensions.block_parsers.len(), 1);
         assert_eq!(extensions.block_renderers.len(), 1);
         assert_eq!(extensions.inline_parsers.len(), 1);
         assert_eq!(extensions.inline_renderers.len(), 1);
         assert_ne!(extensions.revision(), 0);
+
+        let fallible = MarkdownExtensions::default()
+            .try_prepare_source(|_| Err::<String, _>("preparation rejected"));
+        assert_eq!(
+            fallible.prepared_source("source").unwrap_err().as_ref(),
+            "preparation rejected"
+        );
 
         let plugin_extensions = MarkdownExtensions::default().inline_plugin(DummyInlinePlugin);
         assert_eq!(plugin_extensions.inline_parsers.len(), 1);

@@ -298,7 +298,7 @@ impl Root {
     /// populated during paint. The result reflects the last painted frame; a
     /// copy action racing ahead of a pending repaint may observe the previous
     /// selection state.
-    pub(crate) fn window_selected_text(&self, cx: &App) -> String {
+    fn window_selected_text_items(&self, cx: &App) -> Vec<(Point<Pixels>, String, bool)> {
         let resolved = self.text_selection.resolved_points(cx);
         let single_view = self.text_selection.single_view();
         // A window selection lives in exactly one scope (its endpoints are
@@ -307,7 +307,7 @@ impl Root {
         // scope contribute, so copying never mixes text across layers.
         let anchor_scope = self.active_selection_scope();
 
-        let mut items: Vec<(Point<Pixels>, String)> = Vec::new();
+        let mut items = Vec::new();
         for (id, (view, _, scope)) in self.selectable_text_views.iter() {
             let Some(view) = view.upgrade() else { continue };
             let state = view.read(cx);
@@ -319,10 +319,11 @@ impl Root {
                 continue;
             }
             let text = state.selected_text();
-            if text.trim().is_empty() {
+            let preserves_copy_boundaries = state.preserves_copy_boundaries();
+            if text.is_empty() || (!preserves_copy_boundaries && text.trim().is_empty()) {
                 continue;
             }
-            items.push((state.bounds().origin, text));
+            items.push((state.bounds().origin, text, preserves_copy_boundaries));
         }
 
         items.sort_by(|a, b| {
@@ -337,10 +338,41 @@ impl Root {
         });
 
         items
+    }
+
+    pub(crate) fn window_selected_text(&self, cx: &App) -> String {
+        self.window_selected_text_items(cx)
             .into_iter()
-            .map(|(_, text)| text)
+            .map(|(_, text, _)| text)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    pub(crate) fn window_selected_text_for_copy(&self, cx: &App) -> String {
+        let items = self.window_selected_text_items(cx);
+        let Some((_, _, preserve_start)) = items.first() else {
+            return String::new();
+        };
+        let preserve_start = *preserve_start;
+        let preserve_end = items
+            .last()
+            .is_some_and(|(_, _, preserve_end)| *preserve_end);
+        let text = items
+            .into_iter()
+            .map(|(_, text, _)| text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = if preserve_start {
+            0
+        } else {
+            text.len() - text.trim_start().len()
+        };
+        let end = if preserve_end {
+            text.len()
+        } else {
+            text.trim_end().len()
+        };
+        text[start..end].to_string()
     }
 
     /// Clear the window selection and all view-local selections.

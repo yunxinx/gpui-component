@@ -28,6 +28,13 @@ pub(crate) fn init(cx: &mut App) {
     state::init(cx);
 }
 
+/// Create a new plain-text view with code location as id.
+#[track_caller]
+pub fn plain(source: impl Into<SharedString>) -> TextView {
+    let id: ElementId = ElementId::CodeLocation(*std::panic::Location::caller());
+    TextView::plain(id, source)
+}
+
 /// Create a new markdown text view with code location as id.
 #[track_caller]
 pub fn markdown(source: impl Into<SharedString>) -> TextView {

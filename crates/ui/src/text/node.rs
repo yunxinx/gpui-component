@@ -477,6 +477,34 @@ impl ImageNode {
             .unwrap_or_else(|| self.alt.clone().unwrap_or_default())
             .to_string()
     }
+
+    pub(crate) fn resolved_url(
+        &self,
+        reference_identifier: Option<&SharedString>,
+        node_cx: &NodeContext,
+    ) -> SharedUri {
+        reference_identifier
+            .and_then(|identifier| node_cx.link_refs.get(identifier))
+            .map(|reference| reference.url.clone().into())
+            .unwrap_or_else(|| self.url.clone())
+    }
+
+    pub(crate) fn resolved_title(
+        &self,
+        reference_identifier: Option<&SharedString>,
+        node_cx: &NodeContext,
+    ) -> String {
+        let Some(reference) =
+            reference_identifier.and_then(|identifier| node_cx.link_refs.get(identifier))
+        else {
+            return self.title();
+        };
+        reference
+            .title
+            .clone()
+            .unwrap_or_else(|| self.alt.clone().unwrap_or_default())
+            .to_string()
+    }
 }
 
 impl PartialEq for ImageNode {
@@ -495,6 +523,7 @@ pub(crate) struct InlineNode {
     /// The text content.
     pub(crate) text: SharedString,
     pub(crate) image: Option<ImageNode>,
+    pub(crate) image_reference_identifier: Option<SharedString>,
     pub(crate) custom: Option<MarkdownNode>,
     /// The text styles, each tuple contains the range of the text and the style.
     pub(crate) marks: Vec<(Range<usize>, TextMark)>,
@@ -506,6 +535,7 @@ impl PartialEq for InlineNode {
     fn eq(&self, other: &Self) -> bool {
         self.text == other.text
             && self.image == other.image
+            && self.image_reference_identifier == other.image_reference_identifier
             && self.custom == other.custom
             && self.marks == other.marks
     }
@@ -516,6 +546,7 @@ impl InlineNode {
         Self {
             text: text.into(),
             image: None,
+            image_reference_identifier: None,
             custom: None,
             marks: vec![],
             state: Arc::new(Mutex::new(InlineState::default())),
@@ -525,6 +556,12 @@ impl InlineNode {
     pub(crate) fn image(image: ImageNode) -> Self {
         let mut this = Self::new("");
         this.image = Some(image);
+        this
+    }
+
+    pub(crate) fn reference_image(image: ImageNode, identifier: SharedString) -> Self {
+        let mut this = Self::image(image);
+        this.image_reference_identifier = Some(identifier);
         this
     }
 
@@ -717,6 +754,11 @@ impl Paragraph {
 
     pub(crate) fn push_image(&mut self, image: ImageNode) {
         self.children.push(InlineNode::image(image));
+    }
+
+    pub(crate) fn push_reference_image(&mut self, image: ImageNode, identifier: SharedString) {
+        self.children
+            .push(InlineNode::reference_image(image, identifier));
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -929,6 +971,13 @@ impl CodeBlock {
     }
 }
 
+/// Normalized and source forms needed to replay a retained definition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetainedDefinitionIdentifier {
+    pub(crate) normalized: SharedString,
+    pub(crate) source: SharedString,
+}
+
 /// A context for rendering nodes, contains link references.
 #[derive(Default, Clone)]
 pub(crate) struct NodeContext {
@@ -1019,6 +1068,18 @@ impl NodeContext {
             .collect()
     }
 
+    /// Return the normalized identifier and replayable source spelling for
+    /// every retained link definition.
+    pub(super) fn reference_replay_identifiers(&self) -> Vec<RetainedDefinitionIdentifier> {
+        self.link_ref_source_identifiers
+            .iter()
+            .map(|(normalized, source)| RetainedDefinitionIdentifier {
+                normalized: normalized.clone(),
+                source: source.clone(),
+            })
+            .collect()
+    }
+
     /// Remove definitions from the fragment that is about to be reparsed.
     /// Missing source positions cannot be partitioned safely.
     pub(super) fn retain_definitions_before(&mut self, offset: usize) -> bool {
@@ -1041,10 +1102,10 @@ impl NodeContext {
         true
     }
 
-    /// Return one replayable source spelling for every retained identifier.
-    /// Duplicate definitions only need one representative because footnote
-    /// references resolve against a document-wide identifier set.
-    pub(super) fn footnote_source_identifiers(&self) -> Option<Vec<SharedString>> {
+    /// Return one normalized identifier and replayable source spelling for
+    /// every retained footnote. Duplicate definitions only need one
+    /// representative because footnote references resolve document-wide.
+    pub(super) fn footnote_replay_identifiers(&self) -> Option<Vec<RetainedDefinitionIdentifier>> {
         let mut identifiers = HashMap::<SharedString, Option<SharedString>>::new();
         for definition in &self.footnote_definitions {
             let source_identifier = identifiers
@@ -1054,7 +1115,12 @@ impl NodeContext {
                 *source_identifier = definition.source_identifier.clone();
             }
         }
-        identifiers.into_values().collect()
+        identifiers
+            .into_iter()
+            .map(|(normalized, source)| {
+                source.map(|source| RetainedDefinitionIdentifier { normalized, source })
+            })
+            .collect()
     }
 }
 
@@ -1133,14 +1199,18 @@ impl Paragraph {
                         .into_any_element(),
                     );
                 }
+                let resolved_url =
+                    image.resolved_url(inline_node.image_reference_identifier.as_ref(), node_cx);
+                let resolved_title =
+                    image.resolved_title(inline_node.image_reference_identifier.as_ref(), node_cx);
                 child_nodes.push(
-                    img(image.url.clone())
+                    img(resolved_url)
                         .id(ix)
                         .object_fit(ObjectFit::Contain)
                         .max_w(relative(1.))
                         .when_some(image.width, |this, width| this.w(width))
                         .when_some(image.link.clone(), |this, link| {
-                            let title = image.title();
+                            let title = resolved_title;
                             this.cursor_pointer()
                                 .tooltip(move |window, cx| {
                                     Tooltip::new(title.clone()).build(window, cx)
@@ -1256,8 +1326,12 @@ impl Paragraph {
                 flush_inline_flow_text(&mut items, &mut text, &mut highlights, &mut links);
                 items.push(
                     InlineFlowItem::image(
-                        image.url.clone(),
-                        image.title(),
+                        image
+                            .resolved_url(inline_node.image_reference_identifier.as_ref(), node_cx),
+                        image.resolved_title(
+                            inline_node.image_reference_identifier.as_ref(),
+                            node_cx,
+                        ),
                         image.width,
                         image.height,
                     )
@@ -2141,6 +2215,43 @@ mod tests {
             .lock()
             .ok()
             .and_then(|styles| styles.as_ref().map(|styles| styles.highlight_theme.clone()))
+    }
+
+    #[test]
+    fn reference_image_resolution_preserves_the_public_image_contract() {
+        let image = ImageNode {
+            url: "https://example.com/original".into(),
+            title: Some("cached title".into()),
+            alt: Some("image alt".into()),
+            ..Default::default()
+        };
+        assert_eq!(image.title(), "cached title");
+
+        let identifier = SharedString::from("image");
+        let mut node_cx = NodeContext::default();
+        node_cx.link_refs.insert(
+            identifier.clone(),
+            LinkMark {
+                url: "https://example.com/current".into(),
+                title: Some("current title".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            image.resolved_url(Some(&identifier), &node_cx).as_ref(),
+            "https://example.com/current"
+        );
+        assert_eq!(
+            image.resolved_title(Some(&identifier), &node_cx),
+            "current title"
+        );
+
+        node_cx.link_refs.get_mut(&identifier).unwrap().title = None;
+        assert_eq!(
+            image.resolved_title(Some(&identifier), &node_cx),
+            "image alt",
+            "a removed reference title must not fall back to a stale cached title"
+        );
     }
 
     #[test]

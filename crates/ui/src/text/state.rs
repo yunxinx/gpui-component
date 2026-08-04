@@ -6,6 +6,7 @@ use gpui::{
     ParentElement as _, Pixels, Point, Render, SharedString, Styled as _, Task, Window,
     prelude::FluentBuilder as _, px,
 };
+use rust_i18n::t;
 
 use crate::{
     ElementExt,
@@ -41,6 +42,8 @@ pub(crate) fn init(cx: &mut App) {
 /// The content format of the text view.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum TextViewFormat {
+    /// Plain-text view.
+    Plain,
     /// Markdown view
     Markdown,
     /// HTML view
@@ -69,8 +72,8 @@ pub struct TextViewState {
     pub(super) auto_scroll: AutoScroll,
 
     pub(super) parsed_content: ParsedContent,
-    /// Content format (markdown / html), used to parse synchronously on the
-    /// main thread for full-replace updates.
+    /// Content format (plain text / Markdown / HTML), used to parse
+    /// synchronously on the main thread for full-replace updates.
     format: TextViewFormat,
     text: String,
     revision: usize,
@@ -81,6 +84,11 @@ pub struct TextViewState {
 }
 
 impl TextViewState {
+    /// Create a plain-text TextViewState.
+    pub fn plain(text: &str, cx: &mut Context<Self>) -> Self {
+        Self::new(TextViewFormat::Plain, text, cx)
+    }
+
     /// Create a Markdown TextViewState.
     pub fn markdown(text: &str, cx: &mut Context<Self>) -> Self {
         Self::new(TextViewFormat::Markdown, text, cx)
@@ -110,6 +118,15 @@ impl TextViewState {
                             Ok(content) => {
                                 state.parsed_content = content;
                                 state.parsed_error = None;
+                            }
+                            Err(_) if state.parsed_error.is_none() => {
+                                // Only append-driven batches publish worker
+                                // results; full replacements parse synchronously.
+                                // Keep the last successful document visible even
+                                // when a coalesced replacement + append requires a
+                                // full parse. The worker retains the authoritative
+                                // source and retries it on the next append.
+                                return;
                             }
                             Err(err) => {
                                 state.parsed_error = Some(err);
@@ -206,6 +223,10 @@ impl TextViewState {
     }
 
     /// Append partial text content to the existing text.
+    ///
+    /// If an append cannot be parsed, the last successfully parsed document
+    /// remains visible. A later append reparses the complete authoritative
+    /// source, allowing temporarily incomplete streaming constructs to recover.
     pub fn push_str(&mut self, new_text: &str, cx: &mut Context<Self>) {
         if new_text.is_empty() {
             return;
@@ -233,6 +254,9 @@ impl TextViewState {
     /// Return the selected text.
     pub fn selected_text(&self) -> String {
         if self.select_all {
+            if self.format == TextViewFormat::Plain {
+                return self.text.clone();
+            }
             return self.parsed_content.document.text();
         }
 
@@ -241,6 +265,10 @@ impl TextViewState {
         }
 
         self.parsed_content.document.selected_text()
+    }
+
+    pub(crate) fn preserves_copy_boundaries(&self) -> bool {
+        self.format == TextViewFormat::Plain
     }
 
     fn increment_update(&mut self, text: &str, append: bool, cx: &mut Context<Self>) {
@@ -452,10 +480,14 @@ impl Render for TextViewState {
         node_cx.code_block_actions = self.code_block_actions.clone();
         node_cx.markdown_extensions = self.markdown_extensions.clone();
         node_cx.style = self.text_view_style.clone();
+        let parsed_error = self
+            .parsed_error
+            .as_ref()
+            .map(|error| self.markdown_extensions.format_parse_error(error));
 
         v_flex()
             .size_full()
-            .map(|this| match &mut self.parsed_error {
+            .map(|this| match parsed_error {
                 None => this.child(document.render_root(
                     if self.scrollable {
                         Some(self.list_state.clone())
@@ -469,8 +501,8 @@ impl Render for TextViewState {
                 Some(err) => this.child(
                     v_flex()
                         .gap_1()
-                        .child("Failed to parse content")
-                        .child(err.to_string()),
+                        .child(t!("TextView.failed_to_parse").to_string())
+                        .child(err),
                 ),
             })
             .on_prepaint(move |bounds, window, cx| {
@@ -739,18 +771,12 @@ fn parse_content(
 
     // markdown-rs resolves links and footnotes while building the AST, so the
     // fragment parser must also know definitions retained in earlier blocks.
-    let retained_reference_source_identifiers = options
+    let retained_reference_identifiers = options
         .append
-        .then(|| {
-            node_cx
-                .link_ref_source_identifiers
-                .values()
-                .cloned()
-                .collect::<Vec<_>>()
-        })
+        .then(|| node_cx.reference_replay_identifiers())
         .unwrap_or_default();
-    let retained_footnote_source_identifiers = if options.append {
-        let Some(identifiers) = node_cx.footnote_source_identifiers() else {
+    let retained_footnote_identifiers = if options.append {
+        let Some(identifiers) = node_cx.footnote_replay_identifiers() else {
             return parse_appended_full_replacement(format, &content, options);
         };
         identifiers
@@ -759,18 +785,31 @@ fn parse_content(
     };
 
     let new_document = match format {
+        TextViewFormat::Plain => format::plain::parse(&source, &mut node_cx),
         TextViewFormat::Markdown
-            if retained_reference_source_identifiers.is_empty()
-                && retained_footnote_source_identifiers.is_empty() =>
+            if retained_reference_identifiers.is_empty()
+                && retained_footnote_identifiers.is_empty() =>
         {
             format::markdown::parse(&source, &mut node_cx)
         }
-        TextViewFormat::Markdown => format::markdown::parse_with_retained_definitions(
-            &source,
-            &retained_reference_source_identifiers,
-            &retained_footnote_source_identifiers,
-            &mut node_cx,
-        ),
+        TextViewFormat::Markdown => {
+            match format::markdown::parse_with_retained_definitions(
+                &source,
+                &retained_reference_identifiers,
+                &retained_footnote_identifiers,
+                &mut node_cx,
+            ) {
+                Ok(document) => Ok(document),
+                // A source preparer may legally rewrite the synthetic
+                // definitions into a shape that cannot be reconstructed or
+                // may merge their identifiers. Reparse the authoritative full
+                // source instead of rejecting an otherwise valid append.
+                Err(_) if options.append => {
+                    return parse_appended_full_replacement(format, &content, options);
+                }
+                Err(error) => Err(error),
+            }
+        }
         TextViewFormat::Html => format::html::parse(&source, &mut node_cx),
     }?;
 
@@ -848,6 +887,27 @@ mod tests {
         })
     }
 
+    fn paragraph_reference_image_destination(
+        content: &ParsedContent,
+        block_ix: usize,
+    ) -> (String, String) {
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[block_ix] else {
+            panic!("expected paragraph at block {block_ix}");
+        };
+        let inline = paragraph
+            .children
+            .iter()
+            .find(|child| child.image.is_some())
+            .expect("expected reference image");
+        let image = inline.image.as_ref().expect("checked image above");
+        (
+            image
+                .resolved_url(inline.image_reference_identifier.as_ref(), &content.node_cx)
+                .to_string(),
+            image.resolved_title(inline.image_reference_identifier.as_ref(), &content.node_cx),
+        )
+    }
+
     fn block_contains_reference(block: &node::BlockNode, identifier: &str) -> bool {
         match block {
             node::BlockNode::Paragraph(paragraph) => {
@@ -861,6 +921,13 @@ mod tests {
                 .any(|child| block_contains_reference(child, identifier)),
             _ => false,
         }
+    }
+
+    fn mdast_contains_link_reference(node: &markdown::mdast::Node) -> bool {
+        matches!(node, markdown::mdast::Node::LinkReference(_))
+            || node
+                .children()
+                .is_some_and(|children| children.iter().any(mdast_contains_link_reference))
     }
 
     fn paragraph_has_footnote_reference(
@@ -994,6 +1061,34 @@ mod tests {
 
         let content = parse_markdown(
             ParsedContent::default(),
+            "![value][stable]\n\ntrailing block\n\n[stable]: https://example.com/old",
+            false,
+        );
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained image-reference paragraph");
+        };
+        let retained_state = paragraph.state.clone();
+        let content = parse_markdown(content, "er", true);
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained image-reference paragraph after definition edit");
+        };
+        assert!(Arc::ptr_eq(&retained_state, &paragraph.state));
+        assert_eq!(
+            paragraph_reference_image_destination(&content, 0),
+            ("https://example.com/older".into(), "value".into())
+        );
+        let content = parse_markdown(content, " \"updated title\"", true);
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained image-reference paragraph after title append");
+        };
+        assert!(Arc::ptr_eq(&retained_state, &paragraph.state));
+        assert_eq!(
+            paragraph_reference_image_destination(&content, 0),
+            ("https://example.com/older".into(), "updated title".into())
+        );
+
+        let content = parse_markdown(
+            ParsedContent::default(),
             "[value][ref]\n\ntrailing block\n\n> [ref]: https://example.com/original",
             false,
         );
@@ -1006,6 +1101,278 @@ mod tests {
         assert!(
             !paragraph_has_reference(&content, 0, "ref"),
             "invalidating a definition must reparse references in retained blocks"
+        );
+    }
+
+    #[test]
+    fn nested_reference_images_track_appended_definition_updates() {
+        let source = concat!(
+            "**![bold][stable]** _![emphasis][stable]_ ",
+            "[![linked][stable]](/outer)\n\n",
+            "trailing block\n\n",
+            "[stable]: https://example.com/old"
+        );
+        let content = parse_markdown(ParsedContent::default(), source, false);
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained image-reference paragraph");
+        };
+        let retained_state = paragraph.state.clone();
+        assert_eq!(
+            paragraph
+                .children
+                .iter()
+                .filter(|child| child.image.is_some())
+                .count(),
+            3
+        );
+
+        let content = parse_markdown(content, "er \"updated title\"", true);
+        let node::BlockNode::Paragraph(paragraph) = &content.document.blocks[0] else {
+            panic!("expected retained paragraph after definition edit");
+        };
+        assert!(Arc::ptr_eq(&retained_state, &paragraph.state));
+
+        let destinations = paragraph
+            .children
+            .iter()
+            .filter_map(|inline| {
+                let image = inline.image.as_ref()?;
+                Some((
+                    inline.image_reference_identifier.as_deref(),
+                    image
+                        .resolved_url(inline.image_reference_identifier.as_ref(), &content.node_cx)
+                        .to_string(),
+                    image.resolved_title(
+                        inline.image_reference_identifier.as_ref(),
+                        &content.node_cx,
+                    ),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            destinations,
+            vec![
+                (
+                    Some("stable"),
+                    "https://example.com/older".into(),
+                    "updated title".into(),
+                );
+                3
+            ]
+        );
+    }
+
+    #[test]
+    fn retained_definitions_participate_in_appended_source_preparation() {
+        let extensions = Arc::new(
+            MarkdownExtensions::default()
+                .parse_options(|options| options.constructs.math_text = true)
+                .prepare_source(|source| {
+                    let has_resolved_reference =
+                        markdown::to_mdast(source, &markdown::ParseOptions::gfm())
+                            .is_ok_and(|root| mdast_contains_link_reference(&root));
+                    if has_resolved_reference {
+                        source.replace(r"\(", "$$").replace(r"\)", "$$")
+                    } else {
+                        source.to_string()
+                    }
+                })
+                .inline_parser(|node, cx| {
+                    let markdown::mdast::Node::InlineMath(_) = node else {
+                        return None;
+                    };
+                    Some(
+                        MarkdownNode::new(
+                            "retained-reference-math",
+                            (
+                                cx.node_source(node)?.to_string(),
+                                cx.prepared_node_source(node)?.to_string(),
+                                cx.node_range(node)?,
+                            ),
+                        )
+                        .text(cx.node_source(node)?),
+                    )
+                }),
+        );
+        let source = "untouched\n\n[label \\(x\\)]: https://example.com/math\n\ntrailing";
+        let content = parse_markdown_with_extensions(
+            ParsedContent::default(),
+            source,
+            false,
+            extensions.clone(),
+        );
+        let node::BlockNode::Paragraph(untouched) = &content.document.blocks[0] else {
+            panic!("expected retained paragraph");
+        };
+        let retained_state = untouched.state.clone();
+
+        let content =
+            parse_markdown_with_extensions(content, "\n\n[label \\(x\\)][]", true, extensions);
+
+        let node::BlockNode::Paragraph(untouched) = &content.document.blocks[0] else {
+            panic!("expected retained paragraph after append");
+        };
+        assert!(
+            Arc::ptr_eq(&retained_state, &untouched.state),
+            "preparing the appended fragment must not rebuild unrelated retained blocks"
+        );
+        let custom = content
+            .document
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                node::BlockNode::Paragraph(paragraph) => Some(paragraph),
+                _ => None,
+            })
+            .flat_map(|paragraph| &paragraph.children)
+            .find(|child| {
+                child
+                    .custom
+                    .as_ref()
+                    .is_some_and(|node| node.name() == "retained-reference-math")
+            })
+            .expect("appended reference label should contain prepared inline math");
+        let custom_node = custom.custom.as_ref().unwrap();
+        let appended_formula_start = source.len() + "\n\n[label ".len();
+        assert_eq!(
+            custom_node.data::<(String, String, std::ops::Range<usize>)>(),
+            Some(&(
+                r"\(x\)".to_string(),
+                "$$x$$".to_string(),
+                appended_formula_start..appended_formula_start + r"\(x\)".len(),
+            ))
+        );
+        assert!(custom.marks.iter().any(|(_, mark)| {
+            mark.link.as_ref().is_some_and(|link| {
+                link.identifier
+                    .as_ref()
+                    .is_some_and(|identifier| content.node_cx.link_refs.contains_key(identifier))
+            })
+        }));
+        assert_eq!(
+            content.document.source.as_ref(),
+            format!("{source}\n\n[label \\(x\\)][]")
+        );
+    }
+
+    #[test]
+    fn retained_definition_replay_prepares_authoritative_spelling_once() {
+        let extensions = Arc::new(MarkdownExtensions::default().prepare_source(|source| {
+            source
+                .chars()
+                .map(|character| match character {
+                    'a' => 'b',
+                    'b' => 'c',
+                    _ => character,
+                })
+                .collect()
+        }));
+        let source = "[aa]: /one\n\nuntouched\n\ntrailing";
+        let content = parse_markdown_with_extensions(
+            ParsedContent::default(),
+            source,
+            false,
+            extensions.clone(),
+        );
+        assert_eq!(
+            content
+                .node_cx
+                .link_ref_source_identifiers
+                .get("bb")
+                .map(|identifier| identifier.as_ref()),
+            Some("aa")
+        );
+        let node::BlockNode::Paragraph(untouched) = &content.document.blocks[1] else {
+            panic!("expected retained paragraph");
+        };
+        let retained_state = untouched.state.clone();
+
+        let content = parse_markdown_with_extensions(content, "\n\n[aa][]", true, extensions);
+        assert!(
+            content
+                .document
+                .blocks
+                .iter()
+                .any(|block| block_contains_reference(block, "bb")),
+            "a non-idempotent preparer must not prepare a retained label twice"
+        );
+        assert_eq!(content.node_cx.link_refs["bb"].url.as_ref(), "/one");
+        let node::BlockNode::Paragraph(untouched) = &content.document.blocks[1] else {
+            panic!("expected retained paragraph after append");
+        };
+        assert!(Arc::ptr_eq(&retained_state, &untouched.state));
+        assert_eq!(
+            content.document.source.as_ref(),
+            format!("{source}\n\n[aa][]")
+        );
+    }
+
+    #[test]
+    fn invalid_synthetic_definition_shape_falls_back_to_full_source() {
+        let extensions = Arc::new(MarkdownExtensions::default().prepare_source(|source| {
+            if source.contains("[ref]: /\n") {
+                source.replacen("[ref]: /\n", "[ref]  /\n", 1)
+            } else {
+                source.to_string()
+            }
+        }));
+        let source = "[ref]: /target\n\nuntouched\n\ntrailing";
+        let content = parse_markdown_with_extensions(
+            ParsedContent::default(),
+            source,
+            false,
+            extensions.clone(),
+        );
+        let content = parse_markdown_with_extensions(content, "\n\n[value][ref]", true, extensions);
+
+        assert!(
+            content
+                .document
+                .blocks
+                .iter()
+                .any(|block| block_contains_reference(block, "ref"))
+        );
+        assert_eq!(content.node_cx.link_refs["ref"].url.as_ref(), "/target");
+        assert_eq!(
+            content.document.source.as_ref(),
+            format!("{source}\n\n[value][ref]")
+        );
+    }
+
+    #[test]
+    fn merged_synthetic_identifiers_fall_back_to_full_source() {
+        let extensions = Arc::new(MarkdownExtensions::default().prepare_source(|source| {
+            if source.contains("[left]: /\n") && source.contains("[rght]: /\n") {
+                source
+                    .replace("[left]: /\n", "[same]: /\n")
+                    .replace("[rght]: /\n", "[same]: /\n")
+            } else {
+                source.to_string()
+            }
+        }));
+        let source = "[left]: /left\n[rght]: /right\n\ntrailing";
+        let content = parse_markdown_with_extensions(
+            ParsedContent::default(),
+            source,
+            false,
+            extensions.clone(),
+        );
+        let content =
+            parse_markdown_with_extensions(content, "\n\n[a][left] [b][rght]", true, extensions);
+
+        for (identifier, url) in [("left", "/left"), ("rght", "/right")] {
+            assert!(
+                content
+                    .document
+                    .blocks
+                    .iter()
+                    .any(|block| block_contains_reference(block, identifier))
+            );
+            assert_eq!(content.node_cx.link_refs[identifier].url.as_ref(), url);
+        }
+        assert_eq!(
+            content.document.source.as_ref(),
+            format!("{source}\n\n[a][left] [b][rght]")
         );
     }
 
@@ -1336,6 +1703,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn source_preparer_observes_the_retained_footnote_boundary() {
+        let extensions = Arc::new(MarkdownExtensions::default().prepare_source(|source| {
+            let root_has_code = markdown::to_mdast(source, &markdown::ParseOptions::gfm())
+                .is_ok_and(|root| {
+                    matches!(
+                        root,
+                        markdown::mdast::Node::Root(root)
+                            if root
+                                .children
+                                .iter()
+                                .any(|child| matches!(child, markdown::mdast::Node::Code(_)))
+                    )
+                });
+            if root_has_code {
+                source.replace("code", "root")
+            } else {
+                source.to_string()
+            }
+        }));
+
+        for indentation in ["    ", "\t"] {
+            let source = format!(
+                "retained paragraph\n\n[^n]: note\n\nseparator paragraph\n\n{indentation}code"
+            );
+            let expected_source = format!("{source} more");
+            let expected = parse_markdown_with_extensions(
+                ParsedContent::default(),
+                &expected_source,
+                false,
+                extensions.clone(),
+            );
+            let content = parse_markdown_with_extensions(
+                ParsedContent::default(),
+                &source,
+                false,
+                extensions.clone(),
+            );
+            let content =
+                parse_markdown_with_extensions(content, " more", true, extensions.clone());
+            let node::BlockNode::CodeBlock(actual_code) = &content.document.blocks[3] else {
+                panic!("expected appended indented code block");
+            };
+            let node::BlockNode::CodeBlock(expected_code) = &expected.document.blocks[3] else {
+                panic!("expected baseline indented code block");
+            };
+            assert_eq!(actual_code.code(), expected_code.code());
+            assert_eq!(actual_code.code().as_ref(), "root more");
+            assert_eq!(actual_code.span, expected_code.span);
+        }
+    }
+
     #[gpui::test]
     fn set_text_then_push_str_appends_to_replaced_content(cx: &mut TestAppContext) {
         cx.update(crate::init);
@@ -1497,6 +1916,94 @@ mod tests {
             parsed_update.result.is_err(),
             "append reused content from an extension revision whose replacement failed"
         );
+    }
+
+    #[gpui::test]
+    fn failed_streaming_append_keeps_stable_document_and_later_recovers(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("stable", cx)));
+        cx.run_until_parked();
+
+        let extensions = MarkdownExtensions::default().try_prepare_source(|source| {
+            if source.ends_with('[') {
+                Err("temporarily incomplete")
+            } else {
+                Ok(source.to_string())
+            }
+        });
+        state.update(cx, |state, cx| {
+            state.set_markdown_extensions(Arc::new(extensions), cx);
+        });
+        cx.run_until_parked();
+
+        state.update(cx, |state, cx| state.push_str(" [", cx));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.text, "stable [");
+            assert_eq!(state.source().as_ref(), "stable");
+            assert_eq!(state.parsed_content.document.text().trim(), "stable");
+            assert!(
+                state.parsed_error.is_none(),
+                "a transient append error must not replace stable content"
+            );
+        });
+
+        state.update(cx, |state, cx| state.push_str("]", cx));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.text, "stable []");
+            assert_eq!(state.source().as_ref(), "stable []");
+            assert_eq!(state.parsed_content.document.text().trim(), "stable []");
+            assert!(state.parsed_error.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn failed_append_coalesced_with_replacement_keeps_synchronous_document(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("old", cx)));
+        cx.run_until_parked();
+
+        let extensions = MarkdownExtensions::default().try_prepare_source(|source| {
+            if source.ends_with('[') {
+                Err("temporarily incomplete")
+            } else {
+                Ok(source.to_string())
+            }
+        });
+        state.update(cx, |state, cx| {
+            state.set_markdown_extensions(Arc::new(extensions), cx);
+        });
+        cx.run_until_parked();
+
+        state.update(cx, |state, cx| {
+            state.set_text("replacement", cx);
+            state.push_str(" [", cx);
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.text, "replacement [");
+            assert_eq!(state.source().as_ref(), "replacement");
+            assert_eq!(state.parsed_content.document.text().trim(), "replacement");
+            assert!(
+                state.parsed_error.is_none(),
+                "an appended tail stays transient when coalesced with a replacement"
+            );
+        });
+
+        state.update(cx, |state, cx| state.push_str("]", cx));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.text, "replacement []");
+            assert_eq!(state.source().as_ref(), "replacement []");
+            assert_eq!(
+                state.parsed_content.document.text().trim(),
+                "replacement []"
+            );
+            assert!(state.parsed_error.is_none());
+        });
     }
 
     #[gpui::test]

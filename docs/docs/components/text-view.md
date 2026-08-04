@@ -1,19 +1,41 @@
 ---
 title: TextView
-description: Renders Markdown and HTML text with optional custom Markdown plugins.
+description: Renders selectable plain text, Markdown, and HTML with optional custom Markdown plugins.
 ---
 
 # TextView
 
-`TextView` renders formatted text in GPUI. It supports Markdown and simple HTML, text selection, code block actions, and custom Markdown plugins for project-specific syntax.
+`TextView` renders text in GPUI. It supports literal plain text, Markdown, simple HTML, text selection, code block actions, and custom Markdown plugins for project-specific syntax.
 
 ## Import
 
 ```rust
-use gpui_component::text::{markdown, TextView};
+use gpui_component::text::{markdown, plain, TextView, TextViewState};
 ```
 
 ## Usage
+
+### Plain text
+
+Use the plain-text format when Markdown, HTML, and math-looking syntax must stay literal. Selection and copying return the authoritative source unchanged, and incremental `TextViewState::push_str` updates remain plain text.
+
+```rust
+plain("**not bold** <b>not HTML</b> $not_math$")
+    .selectable(true)
+```
+
+Use `TextView::plain` when the element needs an explicit stable id:
+
+```rust
+TextView::plain("message", literal_source).selectable(true)
+```
+
+For a stateful view, create and retain a plain state just like a Markdown state:
+
+```rust
+let state = cx.new(|cx| TextViewState::plain(source, cx));
+TextView::new(&state).selectable(true)
+```
 
 ### Markdown
 
@@ -140,9 +162,9 @@ MarkdownNode::new("ticker", TickerNode { symbol })
 - `text` is the plain text representation used by selection and fallback rendering.
 - `markdown` is the Markdown representation used when the document is serialized back to Markdown.
 
-## Block Plugins
+## Block and Inline Extensions
 
-Custom Markdown rendering currently supports block plugins. Return `true` from `is_block()` for plugins that should be registered today:
+The `MarkdownPlugin` API above remains supported for block-level replacements. Return `true` from `is_block()` so its legacy renderer is used:
 
 ```rust
 fn is_block(&self) -> bool {
@@ -150,7 +172,41 @@ fn is_block(&self) -> bool {
 }
 ```
 
-Inline plugins are reserved for future `TextView` support.
+For an atomic inline node that must coexist with native prose, marks, links, images, headings, selection, and copying, use `MarkdownInlinePlugin` or the typed `MarkdownExtensions::inline_parser` / `inline_renderer` pair. An inline parser claims only the mdast node it understands. Returning `None` leaves the node on TextView's native path; returning `None` from the renderer keeps the node's styled, selectable `MarkdownNode::text` fallback.
+
+Attach a reusable extension registry when an integration needs more than one stage:
+
+```rust
+use gpui::SharedString;
+use gpui_component::text::MarkdownExtensions;
+
+let extensions = MarkdownExtensions::default()
+    .cjk_emphasis_compatibility()
+    .parse_options(|options| options.constructs.math_text = true)
+    .try_prepare_source(|source| Ok::<_, SharedString>(source.to_string()))
+    .inline_parser(parse_formula)
+    .inline_renderer("formula", render_formula)
+    .block_parser(parse_formula_block)
+    .block_renderer("formula", render_formula_block);
+
+TextView::markdown("preview", source).markdown_extensions(extensions)
+```
+
+`cjk_emphasis_compatibility` is opt-in. It recognizes the narrow `*` / `**`
+flanking patterns used when CJK opening or closing punctuation touches nearby
+Han prose, such as `一次**“重点”**说明`. The default remains strict GFM, and
+underscore emphasis, escaped markers, code, HTML, and link destinations keep
+their native semantics.
+
+## Source Preparation
+
+`prepare_source` and `try_prepare_source` create a parse-only view before mdast conversion. The returned string must preserve both the exact UTF-8 byte length and every character boundary. TextView continues to use the original Markdown for node ranges, selection, copying, serialization, and incremental updates.
+
+Native direct and reference-style images continue to resolve their URL and title through the prepared AST and definitions, while their user-facing alt text is recovered from the authoritative Markdown. A preparer may therefore mask a hazardous delimiter inside an image label without exposing the masked text or losing reference-image resolution.
+
+Use `try_prepare_source` when an integration may be unable to prove that a rewrite is semantically safe. Returning an error aborts parsing instead of publishing a parse view with invalid offsets or changed native Markdown meaning. During incremental parsing, a preparer may receive synthetic retained definitions before the authoritative fragment so reference resolution remains stable; parser callbacks should use `MarkdownParseContext::source`, `node_source`, and `node_range` for the original document view.
+
+Source preparation can run on a background task. Return stable, locale-independent diagnostics there, then use `parse_error_formatter` to turn them into a user-facing message during TextView's UI render pass. Because the formatter runs on every error render, applications can resolve the current locale without rebuilding or reparsing the document.
 
 ## Code Block Actions
 
