@@ -12,6 +12,7 @@ mod utils;
 mod window_selection;
 
 use gpui::{App, ElementId, IntoElement, RenderOnce, SharedString, Window};
+pub use inline::{SelectableText, SelectableTextState};
 pub use inline_flow::{InlineFlow, InlineFlowItem, InlineFlowState, InlineMetrics};
 #[doc(hidden)]
 pub use inline_flow::{InlineFlowLayoutState, InlineFlowPrepaintState};

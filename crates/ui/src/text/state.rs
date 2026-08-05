@@ -86,21 +86,36 @@ pub struct TextViewState {
 impl TextViewState {
     /// Create a plain-text TextViewState.
     pub fn plain(text: &str, cx: &mut Context<Self>) -> Self {
-        Self::new(TextViewFormat::Plain, text, cx)
+        Self::new(TextViewFormat::Plain, text, true, cx)
     }
 
     /// Create a Markdown TextViewState.
     pub fn markdown(text: &str, cx: &mut Context<Self>) -> Self {
-        Self::new(TextViewFormat::Markdown, text, cx)
+        Self::new(TextViewFormat::Markdown, text, true, cx)
+    }
+
+    /// Create a Markdown state whose scrollable view measures only visible blocks initially.
+    ///
+    /// The retained [`ListState`] is created with lazy measurement and is never
+    /// replaced, so callers may safely keep the handle returned by
+    /// [`Self::scroll_state`]. This is intended for large documents shown in a
+    /// definite-height [`TextView`](super::TextView).
+    pub fn markdown_with_lazy_scroll_measurement(text: &str, cx: &mut Context<Self>) -> Self {
+        Self::new(TextViewFormat::Markdown, text, false, cx)
     }
 
     /// Create a HTML TextViewState.
     pub fn html(text: &str, cx: &mut Context<Self>) -> Self {
-        Self::new(TextViewFormat::Html, text, cx)
+        Self::new(TextViewFormat::Html, text, true, cx)
     }
 
     /// Create a new TextViewState.
-    fn new(format: TextViewFormat, text: &str, cx: &mut Context<Self>) -> Self {
+    fn new(
+        format: TextViewFormat,
+        text: &str,
+        eager_scroll_measurement: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         let entity_id = cx.entity_id();
 
@@ -155,11 +170,14 @@ impl TextViewState {
             select_all: false,
             selectable: false,
             scrollable: false,
-            // Measure all blocks (not just visible ones) so the scrollbar
-            // thumb size stays stable. Without this, off-screen blocks count
-            // as zero height until scrolled into view, which makes the
-            // scrollbar jitter as more blocks get measured during scrolling.
-            list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)).measure_all(),
+            // Eager measurement keeps ordinary scrollbar thumbs exact. Large
+            // documents opt into lazy measurement at construction time so the
+            // retained handle is never replaced after being shared.
+            list_state: if eager_scroll_measurement {
+                ListState::new(0, gpui::ListAlignment::Top, px(1000.)).measure_all()
+            } else {
+                ListState::new(0, gpui::ListAlignment::Top, px(1000.))
+            },
             text_view_style: TextViewStyle::default(),
             code_block_actions: None,
             markdown_extensions: Arc::default(),
@@ -208,6 +226,14 @@ impl TextViewState {
         }
         self.scrollable = scrollable;
         cx.notify();
+    }
+
+    /// Return the retained scroll state used by scrollable text views.
+    ///
+    /// Owners can use this to coordinate an enclosing scrollbar, follow-tail
+    /// behavior, or a custom scroll animation without replacing the document.
+    pub fn scroll_state(&self) -> ListState {
+        self.list_state.clone()
     }
 
     /// Set the text content.

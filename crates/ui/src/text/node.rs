@@ -245,6 +245,15 @@ impl BlockNode {
                                 selected.push_str(&fragment);
                             }
                         }
+                        if let Some(state) = node.attached_selectable_text_state() {
+                            let fragment = state.selected_text();
+                            if !fragment.is_empty() {
+                                if !selected.is_empty() {
+                                    selected.push('\n');
+                                }
+                                selected.push_str(&fragment);
+                            }
+                        }
                         selected
                     }
                 };
@@ -297,6 +306,9 @@ impl BlockNode {
             BlockNode::CodeBlock(code_block) => code_block.clear_selection(),
             BlockNode::Custom(node) => {
                 for state in node.attached_inline_flow_states() {
+                    state.clear_selection();
+                }
+                if let Some(state) = node.attached_selectable_text_state() {
                     state.clear_selection();
                 }
             }

@@ -18,6 +18,7 @@ use crate::text::{
     node::{LinkMark, Span, TextMark},
 };
 
+use super::inline::SelectableTextState;
 use super::inline_flow::InlineFlowState;
 
 static MARKDOWN_EXTENSIONS_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -294,6 +295,7 @@ pub struct MarkdownNode {
     data: Arc<dyn Any + Send + Sync>,
     inline_flow_states: Vec<InlineFlowState>,
     inline_flow_breaks_before: Option<Vec<usize>>,
+    selectable_text_state: Option<SelectableTextState>,
     heading_level: Option<u8>,
     pub(crate) span: Option<Span>,
 }
@@ -311,6 +313,7 @@ impl MarkdownNode {
             data: Arc::new(data),
             inline_flow_states: Vec::new(),
             inline_flow_breaks_before: None,
+            selectable_text_state: None,
             heading_level: None,
             span: None,
         }
@@ -379,6 +382,12 @@ impl MarkdownNode {
         self
     }
 
+    /// Attach persistent selection state for one continuous styled text element.
+    pub fn selectable_text_state(mut self, state: SelectableTextState) -> Self {
+        self.selectable_text_state = Some(state);
+        self
+    }
+
     /// Mark this custom block as a replacement for a native Markdown heading.
     ///
     /// The TextView block renderer will apply its native heading typography and
@@ -396,6 +405,11 @@ impl MarkdownNode {
     /// Selection states attached by [`Self::inline_flow_states`].
     pub fn attached_inline_flow_states(&self) -> &[InlineFlowState] {
         &self.inline_flow_states
+    }
+
+    /// Selection state attached by [`Self::selectable_text_state`].
+    pub fn attached_selectable_text_state(&self) -> Option<&SelectableTextState> {
+        self.selectable_text_state.as_ref()
     }
 
     pub(crate) fn attached_inline_flow_breaks_before(&self) -> Option<&[usize]> {
@@ -443,6 +457,10 @@ impl fmt::Debug for MarkdownNode {
             .field("text", &self.text)
             .field("markdown", &self.markdown)
             .field("inline_flow_state_count", &self.inline_flow_states.len())
+            .field(
+                "has_selectable_text_state",
+                &self.selectable_text_state.is_some(),
+            )
             .field("inline_flow_breaks_before", &self.inline_flow_breaks_before)
             .field("heading_level", &self.heading_level)
             .field("span", &self.span)
