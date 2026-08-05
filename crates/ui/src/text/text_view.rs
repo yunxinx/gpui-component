@@ -371,10 +371,12 @@ impl Element for TextView {
         let mut el = div()
             .key_context("TextView")
             .track_focus(&focus_handle)
-            .when(self.scrollable, |this| {
-                this.size_full().vertical_scrollbar(&list_state)
-            })
             .relative()
+            // Paint the document first and append the scrollbar last. The
+            // scrollbar is an overlay; putting it before the state lets rich
+            // Markdown surfaces (notably fenced-code backgrounds) paint over
+            // the thumb and also makes the first lazy-measurement frame hide
+            // it before the list has established its content size.
             .on_action(move |_: &crate::input::Copy, window, cx| {
                 let text = crate::Root::read(window, cx).window_selected_text_for_copy(cx);
                 if text.is_empty() {
@@ -385,6 +387,9 @@ impl Element for TextView {
             })
             .on_action(window.listener_for(&state, TextViewState::on_action_select_all))
             .child(state.clone())
+            .when(self.scrollable, |this| {
+                this.size_full().vertical_scrollbar(&list_state)
+            })
             .refine_style(&self.style)
             .into_any_element();
         let layout_id = el.request_layout(window, cx);
@@ -1334,6 +1339,137 @@ mod tests {
         assert!(
             (max - min) < 2.0,
             "list content total jittered while scrolling: min={min} max={max} totals={totals:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn lazy_markdown_streaming_total_does_not_regress(cx: &mut TestAppContext) {
+        struct Root {
+            state: gpui::Entity<crate::text::TextViewState>,
+        }
+
+        impl Render for Root {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .w(px(360.))
+                    .h(px(180.))
+                    .child(TextView::new(&self.state).scrollable(true).size_full())
+            }
+        }
+
+        cx.update(crate::init);
+        let state = cx.update(|cx| {
+            cx.new(|cx| {
+                TextViewState::markdown_with_lazy_scroll_measurement(
+                    &(0..20)
+                        .map(|index| format!("paragraph {index}"))
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                    cx,
+                )
+            })
+        });
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let root = cx.new(|_| Root {
+                state: state.clone(),
+            });
+            crate::Root::new(root, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let draw = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        };
+        draw(cx);
+
+        let total = |cx: &mut VisualTestContext| {
+            state.read_with(cx, |state, _| {
+                let list = state.scroll_state();
+                f32::from(list.max_offset_for_scrollbar().y + list.viewport_bounds().size.height)
+            })
+        };
+
+        let mut totals = vec![total(cx)];
+        for index in 1..=20 {
+            state.update(cx, |state, cx| {
+                state.push_str(&format!("\n\nparagraph {index}"), cx);
+            });
+            draw(cx);
+            totals.push(total(cx));
+        }
+
+        assert!(
+            totals.windows(2).all(|pair| pair[1] + 0.1 >= pair[0]),
+            "streaming Markdown content height regressed: {totals:?}"
+        );
+        assert!(
+            totals.last().copied().unwrap_or_default() >= 1500.,
+            "streaming Markdown scrollbar total stopped reflecting appended blocks: {totals:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn markdown_scrollbar_track_remains_interactive_above_code_content(cx: &mut TestAppContext) {
+        struct Root {
+            state: gpui::Entity<crate::text::TextViewState>,
+        }
+
+        impl Render for Root {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .w(px(360.))
+                    .h(px(180.))
+                    .child(TextView::new(&self.state).scrollable(true).size_full())
+            }
+        }
+
+        cx.update(crate::init);
+        cx.update(|cx| {
+            crate::Theme::global_mut(cx).scrollbar_show = crate::scroll::ScrollbarShow::Always;
+        });
+        let source = (0..80)
+            .map(|index| format!("```text\ncode line {index}\n```"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let state = cx.update(|cx| {
+            cx.new(|cx| TextViewState::markdown_with_lazy_scroll_measurement(&source, cx))
+        });
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let root = cx.new(|_| Root {
+                state: state.clone(),
+            });
+            crate::Root::new(root, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let before = state.read_with(cx, |state, _| {
+            state.scroll_state().scroll_px_offset_for_scrollbar()
+        });
+        cx.simulate_click(gpui::point(px(356.), px(150.)), Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let after = state.read_with(cx, |state, _| {
+            state.scroll_state().scroll_px_offset_for_scrollbar()
+        });
+        assert!(
+            after.y < before.y,
+            "scrollbar track click was covered by Markdown code content: before={before:?} after={after:?}"
         );
     }
 }

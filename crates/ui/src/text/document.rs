@@ -1,6 +1,6 @@
 use gpui::{
     App, Hsla, InteractiveElement as _, IntoElement, ListState, ParentElement as _, SharedString,
-    Styled as _, Window, div,
+    Styled as _, Window, div, px,
 };
 
 use crate::text::node::{BlockNode, NodeContext};
@@ -105,7 +105,17 @@ impl ParsedDocument {
         let blocks = &self.blocks;
 
         if list_state.item_count() != blocks.len() {
-            list_state.reset(blocks.len());
+            // Keep a bounded scrollbar estimate for blocks outside the
+            // viewport. Unknown items otherwise contribute zero height until
+            // they are visited, which makes a growing stream's thumb jump
+            // taller and then stop reflecting the document length.
+            let previous_offset = (list_state.item_count() > 0
+                && list_state.viewport_bounds().size.height > px(0.))
+            .then(|| list_state.scroll_px_offset_for_scrollbar());
+            list_state.reset_with_uniform_height(blocks.len(), window.line_height().max(px(1.)));
+            if let Some(previous_offset) = previous_offset {
+                list_state.set_offset_from_scrollbar(previous_offset);
+            }
         }
 
         div().id("document").size_full().child(
