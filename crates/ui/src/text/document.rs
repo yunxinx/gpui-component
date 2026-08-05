@@ -112,7 +112,9 @@ impl ParsedDocument {
             let previous_offset = (list_state.item_count() > 0
                 && list_state.viewport_bounds().size.height > px(0.))
             .then(|| list_state.scroll_px_offset_for_scrollbar());
-            list_state.reset_with_uniform_height(blocks.len(), window.line_height().max(px(1.)));
+            let estimated_height = window.line_height().max(px(1.))
+                + node_cx.style.paragraph_gap.to_pixels(window.rem_size());
+            list_state.reset_with_uniform_height(blocks.len(), estimated_height);
             if let Some(previous_offset) = previous_offset {
                 list_state.set_offset_from_scrollbar(previous_offset);
             }

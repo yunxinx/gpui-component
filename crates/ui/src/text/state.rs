@@ -55,6 +55,7 @@ pub struct TextViewState {
     pub(super) focus_handle: FocusHandle,
     pub(super) entity_id: gpui::EntityId,
     pub(super) list_state: ListState,
+    estimated_block_height: Option<Pixels>,
 
     /// The bounds of the text view
     bounds: Bounds<Pixels>,
@@ -131,7 +132,7 @@ impl TextViewState {
 
                         match parsed_update.result {
                             Ok(content) => {
-                                state.parsed_content = content;
+                                state.replace_parsed_content(content);
                                 state.parsed_error = None;
                             }
                             Err(_) if state.parsed_error.is_none() => {
@@ -178,6 +179,7 @@ impl TextViewState {
             } else {
                 ListState::new(0, gpui::ListAlignment::Top, px(1000.))
             },
+            estimated_block_height: None,
             text_view_style: TextViewStyle::default(),
             code_block_actions: None,
             markdown_extensions: Arc::default(),
@@ -234,6 +236,58 @@ impl TextViewState {
     /// behavior, or a custom scroll animation without replacing the document.
     pub fn scroll_state(&self) -> ListState {
         self.list_state.clone()
+    }
+
+    fn replace_parsed_content(&mut self, content: ParsedContent) {
+        self.sync_list_items(&content);
+        self.parsed_content = content;
+    }
+
+    fn sync_list_items(&self, content: &ParsedContent) {
+        let Some(estimated_height) = self.estimated_block_height else {
+            return;
+        };
+        let old_blocks = &self.parsed_content.document.blocks;
+        let new_blocks = &content.document.blocks;
+        if self.list_state.item_count() != old_blocks.len() {
+            return;
+        }
+
+        let prefix_len = old_blocks
+            .iter()
+            .zip(new_blocks)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let suffix_len = old_blocks[prefix_len..]
+            .iter()
+            .rev()
+            .zip(new_blocks[prefix_len..].iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        let old_changed_len = old_blocks.len() - prefix_len - suffix_len;
+        let new_changed_len = new_blocks.len() - prefix_len - suffix_len;
+        let retained_changed_len = old_changed_len.min(new_changed_len);
+
+        if old_blocks.len() != new_blocks.len() && suffix_len == 0 && prefix_len > 0 {
+            // An unchanged boundary block gains or loses the paragraph gap
+            // when an append or truncation changes which block is last.
+            self.list_state.remeasure_items(prefix_len - 1..prefix_len);
+        }
+        if retained_changed_len > 0 {
+            self.list_state
+                .remeasure_items(prefix_len..prefix_len + retained_changed_len);
+        }
+
+        let removed_range = prefix_len + retained_changed_len
+            ..prefix_len + retained_changed_len + (old_changed_len - retained_changed_len);
+        let inserted_count = new_changed_len - retained_changed_len;
+        if !removed_range.is_empty() || inserted_count > 0 {
+            self.list_state.splice_with_uniform_height(
+                removed_range,
+                inserted_count,
+                estimated_height,
+            );
+        }
     }
 
     /// Set the text content.
@@ -323,7 +377,7 @@ impl TextViewState {
         if !append {
             match parse_content(self.format, ParsedContent::default(), &update_options) {
                 Ok(content) => {
-                    self.parsed_content = content;
+                    self.replace_parsed_content(content);
                     self.parsed_error = None;
                     if !self.is_selecting {
                         self.reset_selection();
@@ -499,6 +553,13 @@ pub(crate) enum TextViewMultiClickKind {
 
 impl Render for TextViewState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.estimated_block_height = Some(
+            window.line_height().max(px(1.))
+                + self
+                    .text_view_style
+                    .paragraph_gap
+                    .to_pixels(window.rem_size()),
+        );
         let state = cx.entity();
         let document = self.parsed_content.document.clone();
         let mut node_cx = self.parsed_content.node_cx.clone();
