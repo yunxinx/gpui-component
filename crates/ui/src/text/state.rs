@@ -132,7 +132,7 @@ impl TextViewState {
 
                         match parsed_update.result {
                             Ok(content) => {
-                                state.replace_parsed_content(content);
+                                state.replace_parsed_content(content, parsed_update.append);
                                 state.parsed_error = None;
                             }
                             Err(_) if state.parsed_error.is_none() => {
@@ -238,12 +238,12 @@ impl TextViewState {
         self.list_state.clone()
     }
 
-    fn replace_parsed_content(&mut self, content: ParsedContent) {
-        self.sync_list_items(&content);
+    fn replace_parsed_content(&mut self, content: ParsedContent, append: bool) {
+        self.sync_list_items(&content, append);
         self.parsed_content = content;
     }
 
-    fn sync_list_items(&self, content: &ParsedContent) {
+    fn sync_list_items(&self, content: &ParsedContent, append: bool) {
         let Some(estimated_height) = self.estimated_block_height else {
             return;
         };
@@ -253,17 +253,29 @@ impl TextViewState {
             return;
         }
 
-        let prefix_len = old_blocks
-            .iter()
-            .zip(new_blocks)
-            .take_while(|(old, new)| old == new)
-            .count();
-        let suffix_len = old_blocks[prefix_len..]
-            .iter()
-            .rev()
-            .zip(new_blocks[prefix_len..].iter().rev())
-            .take_while(|(old, new)| old == new)
-            .count();
+        // A normal append reparses only the previous last block. Avoid
+        // walking an already-complete large block on every stream chunk.
+        // Definition changes can force a full reparse, so retain the generic
+        // structural diff whenever the rendering context changed.
+        let use_incremental_prefix = append
+            && self.parsed_content.node_cx == content.node_cx
+            && old_blocks.len().saturating_sub(1) <= new_blocks.len();
+        let (prefix_len, suffix_len) = if use_incremental_prefix {
+            (old_blocks.len().saturating_sub(1), 0)
+        } else {
+            let prefix_len = old_blocks
+                .iter()
+                .zip(new_blocks)
+                .take_while(|(old, new)| old == new)
+                .count();
+            let suffix_len = old_blocks[prefix_len..]
+                .iter()
+                .rev()
+                .zip(new_blocks[prefix_len..].iter().rev())
+                .take_while(|(old, new)| old == new)
+                .count();
+            (prefix_len, suffix_len)
+        };
         let old_changed_len = old_blocks.len() - prefix_len - suffix_len;
         let new_changed_len = new_blocks.len() - prefix_len - suffix_len;
         let retained_changed_len = old_changed_len.min(new_changed_len);
@@ -377,7 +389,7 @@ impl TextViewState {
         if !append {
             match parse_content(self.format, ParsedContent::default(), &update_options) {
                 Ok(content) => {
-                    self.replace_parsed_content(content);
+                    self.replace_parsed_content(content, false);
                     self.parsed_error = None;
                     if !self.is_selecting {
                         self.reset_selection();
@@ -698,6 +710,7 @@ impl Future for UpdateFuture {
                     if options.publish_result {
                         _ = self.tx_result.try_send(ParsedUpdate {
                             revision: options.revision,
+                            append: options.append,
                             result: res,
                         });
                     }
@@ -737,6 +750,7 @@ impl UpdateOptions {
 
 struct ParsedUpdate {
     revision: usize,
+    append: bool,
     result: Result<ParsedContent, SharedString>,
 }
 
