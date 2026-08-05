@@ -7,13 +7,14 @@ use std::{
 };
 
 #[cfg(test)]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use gpui::{
-    App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId, GlobalElementId,
-    Font, Half, HighlightStyle, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    SharedString, StyledText, TextAlign, TextLayout, TextRun, WhiteSpace, Window, point, px, quad,
+    App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId, Font,
+    GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, SharedString, StyledText, TextAlign, TextLayout, TextRun, WhiteSpace, Window, point, px,
+    quad,
 };
 
 use crate::{
@@ -81,7 +82,7 @@ impl SelectableTextState {
     fn set_rendered_text(&self, text: SharedString) {
         if let Ok(mut inner) = self.inner.lock() {
             if inner.text != text {
-                inner.text = text;
+                inner.set_text(text);
                 inner.selection = None;
             }
         }
@@ -129,6 +130,9 @@ thread_local! {
     static PAINTED_LINE_NUMBERS: RefCell<Vec<(usize, usize)>> = const {
         RefCell::new(Vec::new())
     };
+    static VISUAL_LINE_CACHE_BUILDS: Cell<usize> = const { Cell::new(0) };
+    static TEXT_BOUND_LINE_VISITS: Cell<usize> = const { Cell::new(0) };
+    static GUTTER_LINE_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
 impl SelectableText {
@@ -352,11 +356,7 @@ impl Inline {
         (true, true, selection)
     }
 
-    fn visual_lines(
-        &self,
-        text_layout: &TextLayout,
-        window: &Window,
-    ) -> VisualLineCache {
+    fn visual_lines(&self, text_layout: &TextLayout, window: &Window) -> VisualLineCache {
         let text_style = window.text_style();
         let key = VisualLineCacheKey {
             width: text_layout.bounds().size.width,
@@ -373,6 +373,9 @@ impl Inline {
         {
             return cache.clone();
         }
+
+        #[cfg(test)]
+        VISUAL_LINE_CACHE_BUILDS.with(|builds| builds.set(builds.get() + 1));
 
         let line_height = key.line_height;
         let mut line_top = Pixels::ZERO;
@@ -429,6 +432,8 @@ impl Inline {
             if line.top >= visible_bottom {
                 break;
             }
+            #[cfg(test)]
+            TEXT_BOUND_LINE_VISITS.with(|visits| visits.set(visits.get() + 1));
             let first_row = (((visible_top - line.top).max(Pixels::ZERO)).as_f32()
                 / line_height.as_f32())
             .floor() as usize;
@@ -583,14 +588,11 @@ impl Element for SelectableText {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        SelectableTextPrepaintState(self.inline.prepaint(
-            id,
-            inspector_id,
-            bounds,
-            request_layout,
-            window,
-            cx,
-        ))
+        SelectableTextPrepaintState {
+            inline: self
+                .inline
+                .prepaint(id, inspector_id, bounds, request_layout, window, cx),
+        }
     }
 
     fn paint(
@@ -608,7 +610,7 @@ impl Element for SelectableText {
             inspector_id,
             bounds,
             request_layout,
-            &mut prepaint.0,
+            &mut prepaint.inline,
             window,
             cx,
         );
@@ -618,20 +620,21 @@ impl Element for SelectableText {
             let mask_bounds = window.content_mask().bounds;
             let text_style = window.text_style();
             let font_size = text_style.font_size.to_pixels(window.rem_size());
-            let mut line_top = bounds.top();
-            for (index, source_line) in text_layout.line_layouts().iter().enumerate() {
-                let visual_row_count = source_line.wrap_boundaries().len() + 1;
-                let line_bottom = line_top + line_height * visual_row_count;
-                if line_bottom <= mask_bounds.top() {
-                    line_top = line_bottom;
-                    continue;
-                }
+            let visual_lines = &prepaint.inline.visual_lines;
+            let visible_top = (mask_bounds.top() - bounds.top()).max(Pixels::ZERO);
+            let first_line = visual_lines
+                .line_bottoms
+                .partition_point(|bottom| *bottom <= visible_top);
+            for (index, line) in visual_lines.lines.iter().enumerate().skip(first_line) {
+                let line_top = bounds.top() + line.top;
                 if line_top >= mask_bounds.bottom() {
                     break;
                 }
                 #[cfg(test)]
+                GUTTER_LINE_VISITS.with(|visits| visits.set(visits.get() + 1));
+                #[cfg(test)]
                 PAINTED_LINE_NUMBERS.with(|painted| {
-                    painted.borrow_mut().push((index + 1, visual_row_count));
+                    painted.borrow_mut().push((index + 1, line.row_ends.len()));
                 });
                 let number: SharedString = (index + 1).to_string().into();
                 let run = TextRun {
@@ -650,7 +653,6 @@ impl Element for SelectableText {
                     line_top,
                 );
                 let _ = shaped.paint(origin, line_height, TextAlign::Left, None, window, cx);
-                line_top = line_bottom;
             }
         }
     }
@@ -712,8 +714,10 @@ impl Element for Inline {
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let text_layout = self.styled_text.layout();
+        let visual_lines = self.visual_lines(text_layout, window);
         let text_bounds = self.text_line_bounds(
-            text_layout,
+            &visual_lines,
+            bounds,
             text_layout.line_height(),
             window.content_mask().bounds,
         );
@@ -725,6 +729,7 @@ impl Element for Inline {
             hitbox,
             text_hitboxes,
             text_bounds,
+            visual_lines,
         }
     }
 
@@ -946,7 +951,8 @@ pub(super) fn point_in_text_selection(
 #[cfg(test)]
 mod tests {
     use super::{
-        PAINTED_LINE_NUMBERS, SelectableText, SelectableTextState, point_in_text_selection,
+        GUTTER_LINE_VISITS, PAINTED_LINE_NUMBERS, SelectableText, SelectableTextState,
+        TEXT_BOUND_LINE_VISITS, VISUAL_LINE_CACHE_BUILDS, point_in_text_selection,
     };
     use crate::{
         ActiveTheme as _, Root,
@@ -954,7 +960,8 @@ mod tests {
     };
     use gpui::{
         AppContext as _, Context, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
-        ParentElement as _, Render, Styled as _, Window, point, px,
+        ParentElement as _, Render, ScrollHandle, StatefulInteractiveElement as _, Styled as _,
+        Window, point, px,
     };
 
     struct SelectableTextTestRoot {
@@ -965,6 +972,12 @@ mod tests {
     struct ClippedSelectableTextTestRoot {
         body: gpui::Entity<TextViewState>,
         extensions: MarkdownExtensions,
+    }
+
+    struct ScrolledSelectableTextTestRoot {
+        body: gpui::Entity<TextViewState>,
+        extensions: MarkdownExtensions,
+        scroll_handle: ScrollHandle,
     }
 
     impl Render for SelectableTextTestRoot {
@@ -982,6 +995,22 @@ mod tests {
                     .selectable(true)
                     .markdown_extensions(self.extensions.clone()),
             )
+        }
+    }
+
+    impl Render for ScrolledSelectableTextTestRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui::div()
+                .id("deep-selectable-text-scroll")
+                .w(px(160.))
+                .h(px(48.))
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll_handle)
+                .child(
+                    TextView::new(&self.body)
+                        .selectable(true)
+                        .markdown_extensions(self.extensions.clone()),
+                )
         }
     }
 
@@ -1166,6 +1195,99 @@ mod tests {
             "a 48px content mask must not shape all {LINE_COUNT} line numbers: {painted:?}"
         );
         assert_eq!(painted[0].0, 1, "the viewport starts at the first line");
+    }
+
+    #[gpui::test]
+    fn deep_scroll_reuses_visual_line_geometry_and_visits_only_visible_lines(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const LINE_COUNT: usize = 2_000;
+
+        cx.update(crate::init);
+        let source = (1..=LINE_COUNT)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let state = SelectableTextState::new(source.clone());
+        let scroll_handle = ScrollHandle::new();
+        let (_, cx) = cx.add_window_view({
+            let scroll_handle = scroll_handle.clone();
+            move |window, cx| {
+                let parser_state = state.clone();
+                let extensions = MarkdownExtensions::default()
+                    .block_parser(move |node, _| {
+                        let markdown::mdast::Node::Code(code) = node else {
+                            return None;
+                        };
+                        Some(
+                            MarkdownNode::new("deep-numbered-text-test", code.value.clone())
+                                .text(code.value.clone())
+                                .selectable_text_state(parser_state.clone()),
+                        )
+                    })
+                    .block_renderer("deep-numbered-text-test", move |node, _, cx| {
+                        let state = node
+                            .attached_selectable_text_state()
+                            .cloned()
+                            .unwrap_or_default();
+                        gpui::div()
+                            .whitespace_nowrap()
+                            .child(
+                                SelectableText::new("deep-numbered-text-inner", state, [])
+                                    .line_number_gutter(px(12.), cx.theme().muted_foreground),
+                            )
+                            .into_any_element()
+                    });
+                let markdown = format!("```text\n{source}\n```");
+                let body = cx.new(|cx| TextViewState::markdown(&markdown, cx));
+                let view = cx.new(|_| ScrolledSelectableTextTestRoot {
+                    body,
+                    extensions,
+                    scroll_handle: scroll_handle.clone(),
+                });
+                Root::new(view, window, cx)
+            }
+        });
+        let cx: &mut gpui::VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let max_offset = scroll_handle.max_offset().y;
+        assert!(max_offset > px(0.), "fixture must overflow vertically");
+
+        scroll_handle.set_offset(point(px(0.), -max_offset / 2.));
+        VISUAL_LINE_CACHE_BUILDS.with(|builds| builds.set(0));
+        TEXT_BOUND_LINE_VISITS.with(|visits| visits.set(0));
+        GUTTER_LINE_VISITS.with(|visits| visits.set(0));
+        PAINTED_LINE_NUMBERS.with(|painted| painted.borrow_mut().clear());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let painted = PAINTED_LINE_NUMBERS.with(|painted| painted.borrow().clone());
+        let bounds_visits = TEXT_BOUND_LINE_VISITS.with(|visits| visits.get());
+        let gutter_visits = GUTTER_LINE_VISITS.with(|visits| visits.get());
+        assert_eq!(
+            VISUAL_LINE_CACHE_BUILDS.with(|builds| builds.get()),
+            0,
+            "an offset-only frame must reuse retained visual-line geometry"
+        );
+        assert!(
+            painted
+                .first()
+                .is_some_and(|(line, _)| *line > LINE_COUNT / 4),
+            "the fixture must paint from a deep document offset: {painted:?}"
+        );
+        assert!(
+            bounds_visits <= 8,
+            "selection hitboxes traversed preceding rows: {bounds_visits} visits"
+        );
+        assert!(
+            gutter_visits <= 8,
+            "the gutter traversed preceding rows: {gutter_visits} visits"
+        );
     }
 
     #[test]
