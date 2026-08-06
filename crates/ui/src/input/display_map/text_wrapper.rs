@@ -21,6 +21,38 @@ pub enum WrappingIndent {
     Same,
 }
 
+/// Restore the indentation metadata that `ShapedLine` does not expose.
+///
+/// GPUI's `LineWrapper` measures indentation relative to the last visual-line
+/// boundary. Keep that rule here so shaping can choose the wrap points while
+/// `WrappingIndent::Same` still receives the same `next_indent` contract.
+fn with_wrapping_indent(line: &str, mut boundaries: Vec<Boundary>) -> Vec<Boundary> {
+    let first_non_space_ix = line
+        .char_indices()
+        .find_map(|(ix, character)| (character != ' ').then_some(ix));
+    let mut previous_boundary_ix = 0;
+    let next_indent = first_non_space_ix
+        .map(|first_non_space_ix| {
+            for boundary in &boundaries {
+                // The wrapping loop has consumed the boundary glyph before
+                // deciding to wrap, so an equal index counts as encountered.
+                if first_non_space_ix <= boundary.ix {
+                    let indent = first_non_space_ix.saturating_sub(previous_boundary_ix);
+                    return gpui::LineWrapper::MAX_INDENT
+                        .min(u32::try_from(indent).unwrap_or(u32::MAX));
+                }
+                previous_boundary_ix = boundary.ix;
+            }
+            0
+        })
+        .unwrap_or(0);
+
+    for boundary in &mut boundaries {
+        boundary.next_indent = next_indent;
+    }
+    boundaries
+}
+
 /// A line with soft wrapped lines info.
 #[derive(Debug, Clone)]
 pub(crate) struct LineItem {
@@ -342,7 +374,7 @@ impl TextWrapper {
                                 && line_str.is_char_boundary(boundary.ix)
                         });
                     if boundaries.len() == line.wrap_boundaries().len() && boundaries_are_valid {
-                        return boundaries;
+                        return with_wrapping_indent(line_str, boundaries);
                     }
                 }
 
@@ -823,7 +855,7 @@ mod tests {
     use super::*;
     use std::rc::Rc;
 
-    use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};
+    use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, TestAppContext, px};
 
     #[test]
     fn test_update() {
@@ -1341,6 +1373,70 @@ mod tests {
         let line = wrapper.line(0).unwrap();
         assert_eq!(line.indent, 2);
         assert_eq!(line.wrapped_lines.as_slice(), [0..5, 5..24]);
+    }
+
+    #[test]
+    fn test_shaped_boundaries_keep_leading_indent() {
+        let boundaries = with_wrapping_indent(
+            "    abcdefghijklmnop",
+            vec![
+                Boundary {
+                    ix: 8,
+                    next_indent: 0,
+                },
+                Boundary {
+                    ix: 16,
+                    next_indent: 0,
+                },
+            ],
+        );
+
+        assert_eq!(
+            boundaries
+                .iter()
+                .map(|boundary| boundary.next_indent)
+                .collect::<Vec<_>>(),
+            vec![4, 4]
+        );
+    }
+
+    #[test]
+    fn test_shaped_boundaries_measure_indent_after_a_leading_wrap() {
+        let boundaries = with_wrapping_indent(
+            "          abcdefghijklmnop",
+            vec![
+                Boundary {
+                    ix: 7,
+                    next_indent: 0,
+                },
+                Boundary {
+                    ix: 14,
+                    next_indent: 0,
+                },
+            ],
+        );
+
+        assert_eq!(
+            boundaries
+                .iter()
+                .map(|boundary| boundary.next_indent)
+                .collect::<Vec<_>>(),
+            vec![3, 3]
+        );
+    }
+
+    #[test]
+    fn test_update_with_shaped_boundaries_preserves_indent() {
+        let cx = TestAppContext::single();
+        let mut wrapper = TextWrapper::new(test_font(), px(14.0), Some(px(40.)));
+        let text = Rope::from("    abcdefghijklmnopqrstuvwxyz");
+        let range = 0..text.len();
+
+        cx.update(|app| wrapper.update(&text, &range, &text, app));
+
+        let line = wrapper.line(0).unwrap();
+        assert!(line.wrapped_lines.len() > 1);
+        assert!(line.indent > 0);
     }
 
     #[test]
