@@ -826,7 +826,17 @@ fn parse_content(
     mut content: ParsedContent,
     options: &UpdateOptions,
 ) -> Result<ParsedContent, SharedString> {
+    // Incremental parses only receive the trailing block, so carry forward
+    // reference definitions collected by earlier blocks before parsing the
+    // append. The resulting context is retained with the parsed document for
+    // render-time resolution of custom inline nodes and native links.
+    let previous_link_refs = content.node_cx.link_refs.clone();
     let mut node_cx = NodeContext {
+        link_refs: if options.append {
+            previous_link_refs
+        } else {
+            Default::default()
+        },
         markdown_extensions: options.markdown_extensions.clone(),
         ..NodeContext::default()
     };
@@ -874,6 +884,8 @@ fn parse_content(
     } else {
         content.document = new_document;
     }
+
+    content.node_cx = node_cx;
 
     Ok(content)
 }
