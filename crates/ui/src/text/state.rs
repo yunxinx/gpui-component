@@ -186,6 +186,16 @@ impl TextViewState {
                                 state.parsed_content = content;
                                 state.parsed_error = None;
                                 state.compatible_layout_update = parsed_update.selection_compatible;
+                                if parsed_update.selection_compatible && state.scrollable {
+                                    // Appends can change the height of the
+                                    // retained block at the viewport boundary.
+                                    // Ask ListState to remeasure with its
+                                    // absolute scroll anchor so a manually
+                                    // chosen offset is not rebased to the new
+                                    // content tail.
+                                    let count = state.list_state.item_count();
+                                    state.list_state.remeasure_items(0..count);
+                                }
                             }
                             Err(err) => {
                                 state.parsed_error = Some(err);
