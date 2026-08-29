@@ -183,6 +183,17 @@ impl TextViewState {
 
                         match parsed_update.result {
                             Ok(content) => {
+                                if parsed_update.selection_compatible {
+                                    let old_count = state.list_state.item_count();
+                                    let new_count = content.document.blocks.len();
+                                    if new_count > old_count {
+                                        state
+                                            .list_state
+                                            .splice(old_count..old_count, new_count - old_count);
+                                    } else if new_count < old_count {
+                                        state.list_state.splice(new_count..old_count, 0);
+                                    }
+                                }
                                 state.parsed_content = content;
                                 state.parsed_error = None;
                                 state.compatible_layout_update = parsed_update.selection_compatible;
