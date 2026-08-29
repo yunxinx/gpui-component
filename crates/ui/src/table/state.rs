@@ -389,9 +389,58 @@ where
     pub fn scroll_to_col(&mut self, col_ix: usize, cx: &mut Context<Self>) {
         let col_ix = col_ix.saturating_sub(self.fixed_left_cols_count());
 
-        self.horizontal_scroll_handle
-            .scroll_to_item(col_ix, ScrollStrategy::Top);
+        // Resolve the offset here instead of deferring it to the virtual list.
+        //
+        // The header and the rows share `horizontal_scroll_handle`, but only
+        // the rows are a `VirtualList`, and a deferred `scroll_to_item` is
+        // applied during that list's prepaint — which runs *after* the header
+        // has already been rendered and prepainted with the old offset. The
+        // header would therefore stay one frame behind the rows.
+        match self.horizontal_offset_for_col(col_ix) {
+            Some(offset_x) => {
+                let mut offset = self.horizontal_scroll_handle.offset();
+                offset.x = offset_x;
+                self.horizontal_scroll_handle.set_offset(offset);
+            }
+            // Before the first layout the viewport size is unknown, let the
+            // virtual list resolve the offset once it has been laid out.
+            None => self
+                .horizontal_scroll_handle
+                .scroll_to_item(col_ix, ScrollStrategy::Top),
+        }
+
         cx.notify();
+    }
+
+    /// The horizontal scroll offset that brings the scrollable (non-fixed)
+    /// column at `col_ix` fully into view.
+    ///
+    /// This mirrors the nearest-edge behavior of [`VirtualListScrollHandle::scroll_to_item`]
+    /// with [`ScrollStrategy::Top`]: an already visible column keeps the current
+    /// offset, otherwise the column is aligned to the edge it overflows. Both
+    /// of those move the offset towards a column that exists, so the result
+    /// never runs past the content and needs no extra clamping.
+    ///
+    /// Returns `None` when the viewport size is not known yet, or when `col_ix`
+    /// is out of range.
+    fn horizontal_offset_for_col(&self, col_ix: usize) -> Option<Pixels> {
+        let viewport_width = self.horizontal_scroll_handle.bounds().size.width;
+        if viewport_width <= px(0.) {
+            return None;
+        }
+
+        let cols = self.col_groups.get(self.fixed_left_cols_count()..)?;
+        let col_left: Pixels = cols.get(..col_ix)?.iter().map(|col| col.width).sum();
+        let col_right = col_left + cols.get(col_ix)?.width;
+        let offset_x = self.horizontal_scroll_handle.offset().x;
+
+        Some(if col_left + offset_x < px(0.) {
+            -col_left
+        } else if col_right + offset_x > viewport_width {
+            viewport_width - col_right
+        } else {
+            offset_x
+        })
     }
 
     /// Returns the selected row index.
@@ -515,11 +564,11 @@ where
         &self.visible_range
     }
 
-    /// Dump table data.
+    /// Dump the header row of the table.
     ///
-    /// Returns a tuple of (headers, rows) where each row is a vector of cell values.
-    pub fn dump(&self, cx: &App) -> (Vec<String>, Vec<Vec<String>>) {
-        // Get header row
+    /// Batched exporters can read the headers once with this, then stream the
+    /// rows with [`Self::dump_range`].
+    pub fn headers(&self, cx: &App) -> Vec<String> {
         let columns_count = self.delegate.columns_count(cx);
         let mut headers = Vec::with_capacity(columns_count);
         for col_ix in 0..columns_count {
@@ -527,10 +576,34 @@ where
             headers.push(column.name.to_string());
         }
 
-        // Get data rows
+        headers
+    }
+
+    /// Dump table data.
+    ///
+    /// Returns a tuple of (headers, rows) where each row is a vector of cell values.
+    ///
+    /// This materializes the complete table in memory. For large tables, prefer
+    /// [`Self::dump_range`] and process rows in batches.
+    pub fn dump(&self, cx: &App) -> (Vec<String>, Vec<Vec<String>>) {
+        self.dump_range(0..self.delegate.rows_count(cx), cx)
+    }
+
+    /// Dump table data for the specified row range.
+    ///
+    /// Returns the same `(headers, rows)` shape as [`Self::dump`], with only
+    /// the rows inside the clamped range.
+    ///
+    /// The requested range is clamped to the table's current row count. For
+    /// large tables, callers can invoke this repeatedly with bounded ranges.
+    pub fn dump_range(&self, range: Range<usize>, cx: &App) -> (Vec<String>, Vec<Vec<String>>) {
+        let columns_count = self.delegate.columns_count(cx);
         let rows_count = self.delegate.rows_count(cx);
-        let mut rows = Vec::with_capacity(rows_count);
-        for row_ix in 0..rows_count {
+        let start = range.start.min(rows_count);
+        let end = range.end.min(rows_count).max(start);
+
+        let mut rows = Vec::with_capacity(end - start);
+        for row_ix in start..end {
             let mut row = Vec::with_capacity(columns_count);
             for col_ix in 0..columns_count {
                 row.push(self.delegate.cell_text(row_ix, col_ix, cx));
@@ -538,7 +611,7 @@ where
             rows.push(row);
         }
 
-        (headers, rows)
+        (self.headers(cx), rows)
     }
 
     /// Re-compute the header layout from the current delegate.
@@ -2174,19 +2247,21 @@ where
 
     fn render_vertical_scrollbar(
         &mut self,
-
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let header_rows = self.header_layout.len().max(1);
         Some(
             div()
                 .absolute()
-                .top(self.options.size.table_row_height() * header_rows as f32)
+                .top(self.options.size.table_row_height() * self.header_layout.len().max(1) as f32)
                 .right_0()
                 .bottom_0()
                 .w(Scrollbar::width())
-                .child(Scrollbar::vertical(&self.vertical_scroll_handle).max_fps(60)),
+                .child(
+                    Scrollbar::vertical(&self.vertical_scroll_handle)
+                        .viewport_from_layout()
+                        .max_fps(60),
+                ),
         )
     }
 
@@ -2201,7 +2276,7 @@ where
             .right_0()
             .bottom_0()
             .h(Scrollbar::width())
-            .child(Scrollbar::horizontal(&self.horizontal_scroll_handle))
+            .child(Scrollbar::horizontal(&self.horizontal_scroll_handle).viewport_from_layout())
     }
 }
 

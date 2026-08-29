@@ -1,24 +1,28 @@
 use std::rc::Rc;
 
+use crate::ThemeStyled as _;
 use crate::{
-    ActiveTheme, AxisExt, FocusableExt as _, Sizable, Size, StyledExt,
-    checkbox::checkbox_check_icon, h_flex, text::Text, tooltip::ComponentTooltip, v_flex,
+    ActiveTheme, AxisExt, Sizable, Size, StyledExt, checkbox::checkbox_check_icon, h_flex,
+    text::Text, tooltip::ComponentTooltip, v_flex,
 };
 use gpui::{
-    AnyElement, App, Axis, Div, ElementId, InteractiveElement, IntoElement, ParentElement,
-    RenderOnce, Role, SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window,
-    div, prelude::FluentBuilder, px, relative, rems,
+    AnyElement, App, Axis, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
+    SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window, div,
+    prelude::FluentBuilder, relative, rems,
 };
+use gpui_base::{Radio as BaseRadio, RadioGroup as BaseRadioGroup};
 
 /// A Radio element.
 ///
 /// This is not included the Radio group implementation, you can manage the group by yourself.
 #[derive(IntoElement)]
 pub struct Radio {
-    base: Div,
+    base: BaseRadio,
     style: StyleRefinement,
     id: ElementId,
     label: Option<Text>,
+    /// The announced name, when the visible label is not it.
+    accessibility_label: Option<SharedString>,
     children: Vec<AnyElement>,
     checked: bool,
     disabled: bool,
@@ -29,16 +33,19 @@ pub struct Radio {
     tooltip: ComponentTooltip,
     position_in_set: Option<usize>,
     size_of_set: Option<usize>,
+    focus_ring_enabled: bool,
 }
 
 impl Radio {
     /// Create a new Radio element with the given id.
     pub fn new(id: impl Into<ElementId>) -> Self {
+        let id = id.into();
         Self {
-            id: id.into(),
-            base: div(),
+            base: BaseRadio::new(id.clone()),
+            id,
             style: StyleRefinement::default(),
             label: None,
+            accessibility_label: None,
             children: Vec::new(),
             checked: false,
             disabled: false,
@@ -49,6 +56,7 @@ impl Radio {
             tooltip: ComponentTooltip::default(),
             position_in_set: None,
             size_of_set: None,
+            focus_ring_enabled: true,
         }
     }
 
@@ -61,6 +69,16 @@ impl Radio {
     /// Set the label of the Radio element.
     pub fn label(mut self, label: impl Into<Text>) -> Self {
         self.label = Some(label.into());
+        self
+    }
+
+    /// Set the name a screen reader announces, when the visible label is not
+    /// it.
+    ///
+    /// A radio's name comes from its [`label`](Self::label) by default. Setting
+    /// this replaces the announced name without changing what is displayed.
+    pub fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.accessibility_label = Some(label.into());
         self
     }
 
@@ -95,24 +113,23 @@ impl Radio {
         self.on_click = Some(Rc::new(handler));
         self
     }
-
-    fn handle_click(
-        on_click: &Option<Rc<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
-        checked: bool,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let new_checked = !checked;
-        if let Some(f) = on_click {
-            (f)(&new_checked, window, cx);
-        }
-    }
 }
 
 impl Sizable for Radio {
     fn with_size(mut self, size: impl Into<Size>) -> Self {
         self.size = size.into();
         self
+    }
+}
+
+impl crate::FocusableExt for Radio {
+    fn focus_ring(mut self, enabled: bool) -> Self {
+        self.focus_ring_enabled = enabled;
+        self
+    }
+
+    fn is_focus_ring_enabled(&self) -> bool {
+        self.focus_ring_enabled
     }
 }
 
@@ -145,6 +162,10 @@ impl RenderOnce for Radio {
             .clone();
         let is_focused = focus_handle.is_focused(window);
         let disabled = self.disabled;
+        let accessibility_label = self
+            .accessibility_label
+            .clone()
+            .or_else(|| self.label.as_ref().map(|label| label.get_text(cx)));
 
         let (border_color, bg) = if checked {
             (cx.theme().primary, cx.theme().primary)
@@ -159,30 +180,27 @@ impl RenderOnce for Radio {
 
         self.base
             .id(self.id.clone())
-            .role(Role::RadioButton)
-            .aria_selected(self.checked)
+            .checked(self.checked)
+            .disabled(self.disabled)
+            .track_focus(&focus_handle)
+            .tab_stop(self.tab_stop)
+            .tab_index(self.tab_index)
+            .when_some(accessibility_label, |this, label| {
+                this.accessibility_label(label)
+            })
             .when_some(
-                self.label.as_ref().map(|l| l.get_text(cx)),
-                |this, label| this.aria_label(label),
+                self.position_in_set.zip(self.size_of_set),
+                |this, (position, size)| this.set_position(position, size),
             )
-            .when_some(self.position_in_set, |this, pos| {
-                this.aria_position_in_set(pos)
-            })
-            .when_some(self.size_of_set, |this, size| this.aria_size_of_set(size))
-            .when(!self.disabled, |this| {
-                this.track_focus(
-                    &focus_handle
-                        .tab_stop(self.tab_stop)
-                        .tab_index(self.tab_index),
-                )
-            })
             .h_flex()
             .gap_x_2()
             .text_color(cx.theme().foreground)
             .items_start()
             .line_height(relative(1.))
             .rounded(cx.theme().radius * 0.5)
-            .focus_ring(is_focused, px(2.), window, cx)
+            .when(is_focused && self.focus_ring_enabled, |this| {
+                this.focus_ring_style(window, cx)
+            })
             .map(|this| match self.size {
                 Size::XSmall => this.text_xs(),
                 Size::Small => this.text_sm(),
@@ -202,7 +220,7 @@ impl RenderOnce for Radio {
                         _ => this.size_4(),
                     })
                     .flex_shrink_0()
-                    .rounded_full()
+                    .rounded_full_style(cx)
                     .border_1()
                     .border_color(border_color)
                     .map(|this| match self.checked {
@@ -235,16 +253,12 @@ impl RenderOnce for Radio {
                 )
             })
             .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                // Avoid focus on mouse down.
-                window.prevent_default();
+                window.prevent_default()
             })
-            .when(!self.disabled, |this| {
-                this.on_click({
-                    let on_click = self.on_click.clone();
-                    move |_, window, cx| {
-                        window.prevent_default();
-                        Self::handle_click(&on_click, checked, window, cx);
-                    }
+            .when_some(self.on_click.clone(), |this, on_click| {
+                this.on_change(move |next, _, window, cx| {
+                    window.prevent_default();
+                    on_click(&next, window, cx);
                 })
             })
             .map(|this| self.tooltip.apply(this))
@@ -362,26 +376,55 @@ impl RenderOnce for RadioGroup {
         };
 
         let total = self.radios.len();
-        let mut container = div().id(self.id).role(Role::RadioGroup);
-        *container.style() = self.style;
+        BaseRadioGroup::new(self.id)
+            .axis(self.layout)
+            .refine_style(&self.style)
+            .child(
+                base.gap_3()
+                    .children(self.radios.into_iter().enumerate().map(|(ix, mut radio)| {
+                        let checked = selected_ix == Some(ix);
 
-        container.child(
-            base.gap_3()
-                .children(self.radios.into_iter().enumerate().map(|(ix, mut radio)| {
-                    let checked = selected_ix == Some(ix);
+                        radio.id = ix.into();
+                        radio.position_in_set = Some(ix + 1);
+                        radio.size_of_set = Some(total);
+                        radio.disabled(disabled).checked(checked).when_some(
+                            on_click.clone(),
+                            |this, on_click| {
+                                this.on_click(move |_, window, cx| on_click(&ix, window, cx))
+                            },
+                        )
+                    })),
+            )
+    }
+}
 
-                    radio.id = ix.into();
-                    radio.position_in_set = Some(ix + 1);
-                    radio.size_of_set = Some(total);
-                    radio.disabled(disabled).checked(checked).when_some(
-                        on_click.clone(),
-                        |this, on_click| {
-                            this.on_click(move |_, window, cx| {
-                                on_click(&ix, window, cx);
-                            })
-                        },
-                    )
-                })),
-        )
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_explicit_accessibility_label_replaces_the_visible_one() {
+        let plain = Radio::new("automatic").label("Automatic");
+        assert_eq!(plain.accessibility_label, None);
+        assert!(matches!(
+            &plain.label,
+            Some(Text::String(label)) if label.as_ref() == "Automatic"
+        ));
+
+        let named = Radio::new("automatic")
+            .label("Automatic")
+            .accessibility_label("Choose automatic mode");
+        assert_eq!(
+            named.accessibility_label.as_deref(),
+            Some("Choose automatic mode"),
+            "an explicit name must win over the visible label"
+        );
+        assert!(
+            matches!(
+                &named.label,
+                Some(Text::String(label)) if label.as_ref() == "Automatic"
+            ),
+            "and must not change what is drawn"
+        );
     }
 }

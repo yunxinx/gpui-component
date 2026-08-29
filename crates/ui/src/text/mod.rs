@@ -5,35 +5,23 @@ mod inline_flow;
 mod markdown_ext;
 mod node;
 pub(crate) mod selection;
+mod selection_adapter;
 mod state;
 mod style;
 mod text_view;
 mod utils;
+#[cfg(test)]
 mod window_selection;
 
 use gpui::{App, ElementId, IntoElement, RenderOnce, SharedString, Window};
-pub use inline::{SelectableText, SelectableTextState};
-pub use inline_flow::{InlineFlow, InlineFlowItem, InlineFlowState, InlineMetrics};
-#[doc(hidden)]
-pub use inline_flow::{InlineFlowLayoutState, InlineFlowPrepaintState};
 pub use markdown_ext::*;
-pub use node::{LinkMark, TextMark};
+pub use node::TableData;
 pub use state::*;
 pub use style::*;
 pub use text_view::*;
-pub(crate) use window_selection::TextSelectionController;
-pub(crate) use window_selection::WindowTextSelection;
-pub(crate) use window_selection::{SelectionScope, SelectionScopeElement};
 
 pub(crate) fn init(cx: &mut App) {
     state::init(cx);
-}
-
-/// Create a new plain-text view with code location as id.
-#[track_caller]
-pub fn plain(source: impl Into<SharedString>) -> TextView {
-    let id: ElementId = ElementId::CodeLocation(*std::panic::Location::caller());
-    TextView::plain(id, source)
 }
 
 /// Create a new markdown text view with code location as id.
