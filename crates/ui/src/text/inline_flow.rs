@@ -5,12 +5,12 @@ use std::{
 };
 
 use gpui::{
-    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, DefiniteLength, Element, ElementId,
-    GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId,
+    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ClickEvent, DefiniteLength, Element,
+    ElementId, GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId,
     InteractiveElement as _, IntoElement, LayoutId, LineFragment as WrapLineFragment, MouseButton,
-    MouseDownEvent, ObjectFit, Pixels, ShapedLine, SharedString, SharedUri, Size,
-    StatefulInteractiveElement as _, Styled, StyledImage as _, TextRun, TextStyle, WhiteSpace,
-    Window, img, point, prelude::FluentBuilder as _, px, relative, size,
+    MouseClickEvent, MouseDownEvent, MouseUpEvent, ObjectFit, Pixels, ShapedLine, SharedString,
+    SharedUri, Size, StatefulInteractiveElement as _, Styled, StyledImage as _, TextRun, TextStyle,
+    WhiteSpace, Window, img, point, prelude::FluentBuilder as _, px, relative, size,
 };
 
 use crate::{
@@ -774,7 +774,16 @@ impl Element for InlineFlow {
                     hitbox,
                 } => {
                     element.paint(window, cx);
-                    paint_atomic_selection(state, text, link, *bounds, hitbox, window, cx);
+                    paint_atomic_selection(
+                        state,
+                        text,
+                        link,
+                        self.link_click_handler.clone(),
+                        *bounds,
+                        hitbox,
+                        window,
+                        cx,
+                    );
                 }
             }
         }
@@ -785,6 +794,7 @@ fn paint_atomic_selection(
     inline_state: &Arc<Mutex<InlineState>>,
     text: &SharedString,
     link: &Option<LinkMark>,
+    link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     bounds: Bounds<Pixels>,
     hitbox: &Hitbox,
     window: &mut Window,
@@ -868,6 +878,38 @@ fn paint_atomic_selection(
             cx.notify(current_view);
         }
     });
+
+    // Keep link activation on mouse-up, matching the native `Inline` path.
+    // This also lets a drag selection win over a click without opening the
+    // destination accidentally.
+    if let Some(link) = link.clone() {
+        window.on_mouse_event({
+            let hitbox = hitbox.clone();
+            let text_view_state = text_view_state.clone();
+            let link_click_handler = link_click_handler.clone();
+            move |event: &MouseUpEvent, phase, window, cx| {
+                if !phase.bubble() || !hitbox.is_hovered(window) {
+                    return;
+                }
+                if text_view_state.read(cx).has_selection(cx) {
+                    return;
+                }
+                gpui_base::TextSelection::end(window, cx);
+                cx.stop_propagation();
+                let click = ClickEvent::Mouse(MouseClickEvent {
+                    down: MouseDownEvent {
+                        button: event.button,
+                        position: event.position,
+                        modifiers: event.modifiers,
+                        click_count: event.click_count,
+                        first_mouse: false,
+                    },
+                    up: event.clone(),
+                });
+                handle_link_click(&link_click_handler, link.url.clone(), click, window, cx);
+            }
+        });
+    }
 }
 
 impl From<&InlineFlowItem> for MeasureItem {
