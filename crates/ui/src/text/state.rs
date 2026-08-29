@@ -50,6 +50,8 @@ pub(crate) fn init(cx: &mut App) {
 /// The content format of the text view.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum TextViewFormat {
+    /// Plain-text view
+    Plain,
     /// Markdown view
     Markdown,
     /// HTML view
@@ -127,6 +129,11 @@ pub struct TextViewState {
 }
 
 impl TextViewState {
+    /// Create a plain-text TextViewState.
+    pub fn plain(text: &str, cx: &mut Context<Self>) -> Self {
+        Self::new(TextViewFormat::Plain, text, cx)
+    }
+
     /// Create a Markdown TextViewState.
     pub fn markdown(text: &str, cx: &mut Context<Self>) -> Self {
         Self::new(TextViewFormat::Markdown, text, cx)
@@ -328,7 +335,7 @@ impl TextViewState {
     fn effective_format(&self) -> SelectionFormat {
         match self.format {
             TextViewFormat::Markdown => self.selection_format,
-            TextViewFormat::Html => SelectionFormat::Plain,
+            TextViewFormat::Plain | TextViewFormat::Html => SelectionFormat::Plain,
         }
     }
 
@@ -485,6 +492,14 @@ impl TextViewState {
         } else {
             Point::default()
         }
+    }
+
+    /// Return the retained scroll state used by scrollable text views.
+    ///
+    /// Consumers can coordinate an enclosing scrollbar or follow-tail behavior
+    /// without replacing the document's state or introducing a second list.
+    pub fn scroll_state(&self) -> ListState {
+        self.list_state.clone()
     }
 
     /// Select all rendered text in this view.
@@ -808,6 +823,7 @@ fn parse_content(
     }
 
     let new_document = match format {
+        TextViewFormat::Plain => format::plain::parse(&source, &mut node_cx),
         TextViewFormat::Markdown => format::markdown::parse(&source, &mut node_cx),
         TextViewFormat::Html => format::html::parse(&source, &mut node_cx),
     }?;

@@ -185,6 +185,9 @@ pub struct InlineFlow {
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
 }
 
+// The text variant keeps its selection state private; callers should use the
+// constructors below rather than constructing the enum fields directly.
+#[allow(private_interfaces)]
 pub enum InlineFlowItem {
     Text {
         state: Arc<Mutex<InlineState>>,

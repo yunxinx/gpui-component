@@ -125,6 +125,26 @@ impl TextView {
         }
     }
 
+    /// Create a new plain-text view.
+    pub fn plain(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Self {
+        Self {
+            id: id.into(),
+            format: Some(TextViewFormat::Plain),
+            text: Some(text.into()),
+            text_view_style: TextViewStyle::default(),
+            style: StyleRefinement::default(),
+            state: None,
+            selectable: false,
+            selection_format: SelectionFormat::default(),
+            scrollable: false,
+            max_lines: None,
+            code_block_actions: None,
+            table_actions: None,
+            link_click_handler: None,
+            markdown_extensions: Arc::default(),
+        }
+    }
+
     /// Create a new markdown text view.
     pub fn markdown(id: impl Into<ElementId>, markdown: impl Into<SharedString>) -> Self {
         Self {
@@ -457,12 +477,10 @@ impl Element for TextView {
             let state = window.use_keyed_state(
                 SharedString::from(format!("{}/state", self.id)),
                 cx,
-                move |_, cx| {
-                    if default_format == TextViewFormat::Markdown {
-                        TextViewState::markdown(default_text.as_str(), cx)
-                    } else {
-                        TextViewState::html(default_text.as_str(), cx)
-                    }
+                move |_, cx| match default_format {
+                    TextViewFormat::Plain => TextViewState::plain(default_text.as_str(), cx),
+                    TextViewFormat::Markdown => TextViewState::markdown(default_text.as_str(), cx),
+                    TextViewFormat::Html => TextViewState::html(default_text.as_str(), cx),
                 },
             );
             self.state = Some(state.clone());
