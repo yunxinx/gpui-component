@@ -1,36 +1,191 @@
 use std::{
+    collections::HashMap,
     ops::Range,
     sync::{Arc, Mutex},
 };
 
 use gpui::{
     AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, DefiniteLength, Element, ElementId,
-    GlobalElementId, HighlightStyle, InspectorElementId, InteractiveElement as _, IntoElement,
-    LayoutId, LineFragment as WrapLineFragment, ObjectFit, Pixels, ShapedLine, SharedString,
-    SharedUri, Size, StatefulInteractiveElement as _, Styled, StyledImage as _, TextRun, TextStyle,
-    WhiteSpace, Window, img, point, prelude::FluentBuilder as _, px, relative, size,
+    GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId,
+    InteractiveElement as _, IntoElement, LayoutId, LineFragment as WrapLineFragment, MouseButton,
+    MouseDownEvent, ObjectFit, Pixels, ShapedLine, SharedString, SharedUri, Size,
+    StatefulInteractiveElement as _, Styled, StyledImage as _, TextRun, TextStyle, WhiteSpace,
+    Window, img, point, prelude::FluentBuilder as _, px, relative, size,
 };
 
 use crate::{
-    text::text_view::{LinkClickHandlerFn, handle_link_click},
+    ActiveTheme as _,
+    global_state::UiGlobalState,
+    input::Selection,
+    text::{
+        TextViewMultiClickKind,
+        text_view::{LinkClickHandlerFn, handle_link_click},
+    },
     tooltip::Tooltip,
 };
 
 use super::{
-    inline::{Inline, InlineState},
+    inline::{Inline, InlineState, point_in_text_selection},
     node::LinkMark,
     utils::image_source,
 };
 
 const IMAGE_LEN: usize = 1;
 
-pub(super) struct InlineFlow {
+/// Persistent selection state for a mixed inline flow.
+#[derive(Clone, Default, Debug)]
+pub struct InlineFlowState {
+    inner: Arc<Mutex<InlineFlowStateInner>>,
+}
+
+#[derive(Default, Debug)]
+struct InlineFlowStateInner {
+    fragments: Vec<InlineFlowSelectionFragment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct InlineFlowSelectionKey {
+    item_ix: usize,
+    source_start: usize,
+    source_end: usize,
+}
+
+#[derive(Debug)]
+struct InlineFlowSelectionFragment {
+    key: InlineFlowSelectionKey,
+    state: Arc<Mutex<InlineState>>,
+    hard_breaks_before: usize,
+}
+
+impl InlineFlowState {
+    pub fn selected_text(&self) -> String {
+        let Ok(inner) = self.inner.lock() else {
+            return String::new();
+        };
+        let mut selected = String::new();
+        let mut has_selected = false;
+        for fragment in &inner.fragments {
+            let Ok(state) = fragment.state.lock() else {
+                continue;
+            };
+            let Some(selection) = &state.selection else {
+                continue;
+            };
+            let start = selection.start.min(selection.end).min(state.text.len());
+            let end = selection.start.max(selection.end).min(state.text.len());
+            if let Some(text) = state.text.get(start..end) {
+                if !text.is_empty() && has_selected {
+                    selected.extend(std::iter::repeat_n('\n', fragment.hard_breaks_before));
+                }
+                selected.push_str(text);
+                has_selected |= !text.is_empty();
+            }
+        }
+        selected
+    }
+
+    pub fn clear_selection(&self) {
+        let Ok(inner) = self.inner.lock() else {
+            return;
+        };
+        for fragment in &inner.fragments {
+            if let Ok(mut state) = fragment.state.lock() {
+                state.selection = None;
+            }
+        }
+    }
+
+    fn synchronize(
+        &self,
+        fragments: &[PositionedFragment],
+        items: &[InlineFlowItem],
+    ) -> Vec<Option<Arc<Mutex<InlineState>>>> {
+        let Ok(mut inner) = self.inner.lock() else {
+            return vec![None; fragments.len()];
+        };
+        let mut previous = std::mem::take(&mut inner.fragments)
+            .into_iter()
+            .map(|fragment| (fragment.key, fragment.state))
+            .collect::<HashMap<_, _>>();
+        let mut current = Vec::new();
+        let mut states = Vec::with_capacity(fragments.len());
+        for fragment in fragments {
+            let Some((key, text, hard_breaks_before)) = fragment.selection_content() else {
+                states.push(None);
+                continue;
+            };
+            let state = match fragment {
+                PositionedFragment::Text {
+                    item_ix,
+                    source_range,
+                    ..
+                } => match items.get(*item_ix) {
+                    Some(InlineFlowItem::Text { state, text, .. })
+                        if source_range.start == 0 && source_range.end == text.len() =>
+                    {
+                        state.clone()
+                    }
+                    _ => previous
+                        .remove(&key)
+                        .unwrap_or_else(|| Arc::new(Mutex::new(InlineState::default()))),
+                },
+                _ => previous
+                    .remove(&key)
+                    .unwrap_or_else(|| Arc::new(Mutex::new(InlineState::default()))),
+            };
+            if let Ok(mut state) = state.lock() {
+                state.set_text(text);
+            }
+            current.push(InlineFlowSelectionFragment {
+                key,
+                state: state.clone(),
+                hard_breaks_before,
+            });
+            states.push(Some(state));
+        }
+        inner.fragments = current;
+        states
+    }
+}
+
+/// Baseline metrics for an atomic inline element.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InlineMetrics {
+    width: Pixels,
+    ascent: Pixels,
+    descent: Pixels,
+}
+
+impl InlineMetrics {
+    pub fn new(width: Pixels, ascent: Pixels, descent: Pixels) -> Self {
+        Self {
+            width: width.max(Pixels::ZERO),
+            ascent: ascent.max(Pixels::ZERO),
+            descent: descent.max(Pixels::ZERO),
+        }
+    }
+    pub fn width(self) -> Pixels {
+        self.width
+    }
+    pub fn ascent(self) -> Pixels {
+        self.ascent
+    }
+    pub fn descent(self) -> Pixels {
+        self.descent
+    }
+    fn size(self) -> Size<Pixels> {
+        size(self.width, self.ascent + self.descent)
+    }
+}
+
+pub struct InlineFlow {
     id: ElementId,
+    state: InlineFlowState,
     items: Vec<InlineFlowItem>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
 }
 
-pub(super) enum InlineFlowItem {
+pub enum InlineFlowItem {
     Text {
         state: Arc<Mutex<InlineState>>,
         text: SharedString,
@@ -44,10 +199,130 @@ pub(super) enum InlineFlowItem {
         width: Option<DefiniteLength>,
         height: Option<DefiniteLength>,
     },
+    Custom {
+        text: SharedString,
+        metrics: InlineMetrics,
+        element: Option<AnyElement>,
+        link: Option<LinkMark>,
+    },
+}
+
+impl InlineFlowItem {
+    pub fn text(text: impl Into<SharedString>) -> Self {
+        Self::text_with_state(text, Arc::new(Mutex::new(InlineState::default())))
+    }
+
+    pub(crate) fn text_with_state(
+        text: impl Into<SharedString>,
+        state: Arc<Mutex<InlineState>>,
+    ) -> Self {
+        Self::Text {
+            state,
+            text: text.into(),
+            links: Vec::new(),
+            highlights: Vec::new(),
+        }
+    }
+
+    pub fn highlights(mut self, highlights: Vec<(Range<usize>, HighlightStyle)>) -> Self {
+        if let Self::Text {
+            highlights: current,
+            ..
+        } = &mut self
+        {
+            *current = highlights;
+        }
+        self
+    }
+
+    pub fn link(mut self, range: Range<usize>, url: impl Into<SharedString>) -> Self {
+        if let Self::Text { links, .. } = &mut self {
+            links.push((
+                range,
+                LinkMark {
+                    url: url.into(),
+                    identifier: None,
+                    title: None,
+                },
+            ));
+        }
+        self
+    }
+
+    pub fn custom(
+        text: impl Into<SharedString>,
+        metrics: InlineMetrics,
+        element: impl IntoElement,
+    ) -> Self {
+        Self::Custom {
+            text: text.into(),
+            metrics,
+            element: Some(element.into_any_element()),
+            link: None,
+        }
+    }
+
+    pub fn custom_link(mut self, url: impl Into<SharedString>) -> Self {
+        if let Self::Custom { link, .. } = &mut self {
+            *link = Some(LinkMark {
+                url: url.into(),
+                identifier: None,
+                title: None,
+            });
+        }
+        self
+    }
+
+    pub(crate) fn with_custom_link_mark(mut self, link: Option<LinkMark>) -> Self {
+        if let Self::Custom { link: current, .. } = &mut self {
+            *current = link;
+        }
+        self
+    }
+
+    pub(crate) fn with_links(mut self, links: Vec<(Range<usize>, LinkMark)>) -> Self {
+        if let Self::Text { links: current, .. } = &mut self {
+            *current = links;
+        }
+        self
+    }
+
+    pub fn image(
+        url: impl Into<SharedUri>,
+        title: impl Into<String>,
+        width: Option<DefiniteLength>,
+        height: Option<DefiniteLength>,
+    ) -> Self {
+        Self::Image {
+            url: url.into(),
+            link: None,
+            title: title.into(),
+            width,
+            height,
+        }
+    }
+
+    pub fn image_link(mut self, url: impl Into<SharedString>) -> Self {
+        if let Self::Image { link, .. } = &mut self {
+            *link = Some(LinkMark {
+                url: url.into(),
+                identifier: None,
+                title: None,
+            });
+        }
+        self
+    }
+
+    pub(crate) fn with_image_link_mark(mut self, link: Option<LinkMark>) -> Self {
+        if let Self::Image { link: current, .. } = &mut self {
+            *current = link;
+        }
+        self
+    }
 }
 
 #[derive(Default)]
-pub(crate) struct InlineFlowLayoutState {
+pub struct InlineFlowLayoutState {
     layout: Arc<Mutex<Option<InlineFlowLayout>>>,
 }
 
@@ -67,12 +342,61 @@ enum PositionedFragment {
         text: SharedString,
         links: Vec<(Range<usize>, LinkMark)>,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
+        hard_breaks_before: usize,
     },
     Image {
         item_ix: usize,
         origin: gpui::Point<Pixels>,
         size: Size<Pixels>,
     },
+    Custom {
+        item_ix: usize,
+        origin: gpui::Point<Pixels>,
+        size: Size<Pixels>,
+        text: SharedString,
+        hard_breaks_before: usize,
+    },
+}
+
+impl PositionedFragment {
+    fn selection_content(&self) -> Option<(InlineFlowSelectionKey, SharedString, usize)> {
+        match self {
+            Self::Text {
+                item_ix,
+                source_range,
+                text,
+                hard_breaks_before,
+                ..
+            } => (!text.is_empty()).then(|| {
+                (
+                    InlineFlowSelectionKey {
+                        item_ix: *item_ix,
+                        source_start: source_range.start,
+                        source_end: source_range.end,
+                    },
+                    text.clone(),
+                    *hard_breaks_before,
+                )
+            }),
+            Self::Custom {
+                item_ix,
+                text,
+                hard_breaks_before,
+                ..
+            } => (!text.is_empty()).then(|| {
+                (
+                    InlineFlowSelectionKey {
+                        item_ix: *item_ix,
+                        source_start: 0,
+                        source_end: text.len(),
+                    },
+                    text.clone(),
+                    *hard_breaks_before,
+                )
+            }),
+            Self::Image { .. } => None,
+        }
+    }
 }
 
 enum MeasureItem {
@@ -80,6 +404,10 @@ enum MeasureItem {
         text: SharedString,
         links: Vec<(Range<usize>, LinkMark)>,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
+    },
+    Custom {
+        text: SharedString,
+        metrics: InlineMetrics,
     },
     Image {
         url: SharedUri,
@@ -102,19 +430,54 @@ enum LineFragmentKind {
         highlights: Vec<(Range<usize>, HighlightStyle)>,
     },
     Image,
+    Custom {
+        text: SharedString,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum FragmentAlignment {
+    Baseline { ascent: Pixels, descent: Pixels },
+    Center,
+}
+
+#[derive(Default)]
+pub struct InlineFlowPrepaintState {
+    fragments: Vec<PrepaintFragment>,
+}
+
+enum PrepaintFragment {
+    Element(AnyElement),
+    Atomic {
+        element: AnyElement,
+        state: Arc<Mutex<InlineState>>,
+        text: SharedString,
+        link: Option<LinkMark>,
+        bounds: Bounds<Pixels>,
+        hitbox: Hitbox,
+    },
 }
 
 impl InlineFlow {
-    pub(super) fn new(
+    pub fn new(
         id: impl Into<ElementId>,
+        state: InlineFlowState,
         items: Vec<InlineFlowItem>,
-        link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     ) -> Self {
         Self {
             id: id.into(),
+            state,
             items,
-            link_click_handler,
+            link_click_handler: None,
         }
+    }
+
+    pub(super) fn with_link_click_handler(
+        mut self,
+        link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    ) -> Self {
+        self.link_click_handler = link_click_handler;
+        self
     }
 
     fn image_element(
@@ -174,7 +537,7 @@ impl IntoElement for InlineFlow {
 
 impl Element for InlineFlow {
     type RequestLayoutState = InlineFlowLayoutState;
-    type PrepaintState = Vec<AnyElement>;
+    type PrepaintState = InlineFlowPrepaintState;
 
     fn id(&self) -> Option<ElementId> {
         Some(self.id.clone())
@@ -208,7 +571,7 @@ impl Element for InlineFlow {
                     window,
                     cx,
                 )),
-                MeasureItem::Text { .. } => None,
+                MeasureItem::Text { .. } | MeasureItem::Custom { .. } => None,
             })
             .collect::<Vec<_>>();
         let layout_state = InlineFlowLayoutState::default();
@@ -258,9 +621,12 @@ impl Element for InlineFlow {
             .ok()
             .and_then(|layout| layout.as_ref().map(|layout| layout.fragments.clone()))
             .unwrap_or_default();
-        let mut elements = Vec::with_capacity(fragments.len());
+        let selection_states = self.state.synchronize(&fragments, &self.items);
+        let mut prepaint = InlineFlowPrepaintState {
+            fragments: Vec::with_capacity(fragments.len()),
+        };
 
-        for fragment in fragments {
+        for (fragment_ix, fragment) in fragments.into_iter().enumerate() {
             match fragment {
                 PositionedFragment::Text {
                     item_ix,
@@ -280,12 +646,16 @@ impl Element for InlineFlow {
                         } if source_range == (0..source.len()) => state.clone(),
                         _ => Arc::new(Mutex::new(InlineState::default())),
                     };
+                    let state = selection_states
+                        .get(fragment_ix)
+                        .and_then(Clone::clone)
+                        .unwrap_or(state);
                     if let Ok(mut state) = state.lock() {
                         state.set_text(text);
                     }
 
                     let mut element = Inline::new(
-                        elements.len(),
+                        fragment_ix,
                         state,
                         links,
                         highlights,
@@ -301,7 +671,7 @@ impl Element for InlineFlow {
                         window,
                         cx,
                     );
-                    elements.push(element);
+                    prepaint.fragments.push(PrepaintFragment::Element(element));
                 }
                 PositionedFragment::Image {
                     item_ix,
@@ -315,7 +685,7 @@ impl Element for InlineFlow {
                         continue;
                     };
                     let mut element = Self::image_element(
-                        elements.len(),
+                        fragment_ix,
                         url,
                         link,
                         title.as_str(),
@@ -331,12 +701,50 @@ impl Element for InlineFlow {
                         window,
                         cx,
                     );
-                    elements.push(element);
+                    prepaint.fragments.push(PrepaintFragment::Element(element));
+                }
+                PositionedFragment::Custom {
+                    item_ix,
+                    origin,
+                    size: fragment_size,
+                    text,
+                    ..
+                } => {
+                    let InlineFlowItem::Custom { element, link, .. } = &mut self.items[item_ix]
+                    else {
+                        continue;
+                    };
+                    let Some(mut element) = element.take() else {
+                        continue;
+                    };
+                    let fragment_bounds = Bounds::new(bounds.origin + origin, fragment_size);
+                    element.prepaint_as_root(
+                        fragment_bounds.origin,
+                        size(
+                            AvailableSpace::Definite(fragment_size.width),
+                            AvailableSpace::Definite(fragment_size.height),
+                        ),
+                        window,
+                        cx,
+                    );
+                    let hitbox = window.insert_hitbox(fragment_bounds, HitboxBehavior::Normal);
+                    let state = selection_states
+                        .get(fragment_ix)
+                        .and_then(Clone::clone)
+                        .unwrap_or_else(|| Arc::new(Mutex::new(InlineState::default())));
+                    prepaint.fragments.push(PrepaintFragment::Atomic {
+                        element,
+                        state,
+                        text,
+                        link: link.clone(),
+                        bounds: fragment_bounds,
+                        hitbox,
+                    });
                 }
             }
         }
 
-        elements
+        prepaint
     }
 
     fn paint(
@@ -349,10 +757,114 @@ impl Element for InlineFlow {
         window: &mut Window,
         cx: &mut App,
     ) {
-        for element in prepaint {
-            element.paint(window, cx);
+        for fragment in &mut prepaint.fragments {
+            match fragment {
+                PrepaintFragment::Element(element) => {
+                    element.paint(window, cx);
+                }
+                PrepaintFragment::Atomic {
+                    element,
+                    state,
+                    text,
+                    link,
+                    bounds,
+                    hitbox,
+                } => {
+                    element.paint(window, cx);
+                    paint_atomic_selection(state, text, link, *bounds, hitbox, window, cx);
+                }
+            }
         }
     }
+}
+
+fn paint_atomic_selection(
+    inline_state: &Arc<Mutex<InlineState>>,
+    text: &SharedString,
+    link: &Option<LinkMark>,
+    bounds: Bounds<Pixels>,
+    hitbox: &Hitbox,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(text_view_state) = UiGlobalState::global(cx).text_view_state().cloned() else {
+        return;
+    };
+    let current_view = window.current_view();
+    let text_view = text_view_state.read(cx);
+    let is_selectable = text_view.is_selectable();
+    let selection = if text_view.is_all_selected() {
+        Some(Selection::from(0..text.len()))
+    } else if let Some(selection) = text_view.multi_click_selection() {
+        bounds
+            .contains(&selection.pos)
+            .then(|| Selection::from(0..text.len()))
+    } else if let Some((selection_start, selection_end)) = text_view.selection_points(cx) {
+        point_in_text_selection(
+            bounds.origin,
+            bounds.size.width,
+            selection_start,
+            selection_end,
+            bounds.size.height,
+        )
+        .then(|| Selection::from(0..text.len()))
+    } else {
+        None
+    };
+
+    if let Ok(mut state) = inline_state.lock() {
+        state.selection = selection;
+    }
+    if !is_selectable {
+        return;
+    }
+
+    window.set_cursor_style(gpui::CursorStyle::IBeam, hitbox);
+    if link.is_some() {
+        window.set_cursor_style(gpui::CursorStyle::PointingHand, hitbox);
+    }
+    let text_bounds = bounds.intersect(&window.content_mask().bounds);
+    if text_bounds.size.width > Pixels::ZERO && text_bounds.size.height > Pixels::ZERO {
+        text_view_state.update(cx, |state, _| {
+            state.selection_adapter.register_inline(vec![text_bounds]);
+        });
+    }
+
+    if selection.is_some() {
+        window.paint_quad(gpui::quad(
+            bounds,
+            px(0.),
+            cx.theme().selection,
+            gpui::Edges::default(),
+            gpui::transparent_black(),
+            gpui::BorderStyle::default(),
+        ));
+    }
+
+    window.on_mouse_event({
+        let hitbox = hitbox.clone();
+        let inline_state = inline_state.clone();
+        let text = text.clone();
+        let text_view_state = text_view_state.clone();
+        move |event: &MouseDownEvent, phase, window, cx| {
+            if !phase.bubble() || !hitbox.is_hovered(window) || event.button != MouseButton::Left {
+                return;
+            }
+            let kind = match event.click_count {
+                2 => TextViewMultiClickKind::Word,
+                3 => TextViewMultiClickKind::Paragraph,
+                _ => return,
+            };
+            gpui_base::GlobalState::suppress_text_selection(cx);
+            if let Ok(mut state) = inline_state.lock() {
+                state.selection = Some((0..text.len()).into());
+            }
+            text_view_state.update(cx, |state, cx| {
+                state.set_multi_click_selection(event.position, kind, text.to_string(), cx);
+            });
+            cx.notify(current_view);
+        }
+    });
 }
 
 impl From<&InlineFlowItem> for MeasureItem {
@@ -376,6 +888,10 @@ impl From<&InlineFlowItem> for MeasureItem {
                 width: *width,
                 height: *height,
             },
+            InlineFlowItem::Custom { text, metrics, .. } => MeasureItem::Custom {
+                text: text.clone(),
+                metrics: *metrics,
+            },
         }
     }
 }
@@ -385,6 +901,7 @@ impl MeasureItem {
         match self {
             MeasureItem::Text { text, .. } => text.len(),
             MeasureItem::Image { .. } => IMAGE_LEN,
+            MeasureItem::Custom { .. } => IMAGE_LEN,
         }
     }
 }
@@ -472,6 +989,19 @@ fn layout_flow(
                         });
                     }
                 }
+                MeasureItem::Custom { text, metrics } => {
+                    if line_range.start <= item_start && item_end <= line_range.end {
+                        let custom_size = metrics.size();
+                        line_width += custom_size.width;
+                        actual_line_height = actual_line_height.max(custom_size.height);
+                        line_fragments.push(LineFragmentLayout {
+                            item_ix,
+                            kind: LineFragmentKind::Custom { text: text.clone() },
+                            size: custom_size,
+                            source_range: 0..text.len(),
+                        });
+                    }
+                }
             }
 
             item_start = item_end;
@@ -493,11 +1023,19 @@ fn layout_flow(
                     text,
                     links,
                     highlights,
+                    hard_breaks_before: 0,
                 },
                 LineFragmentKind::Image => PositionedFragment::Image {
                     item_ix: fragment.item_ix,
                     origin,
                     size: fragment.size,
+                },
+                LineFragmentKind::Custom { text } => PositionedFragment::Custom {
+                    item_ix: fragment.item_ix,
+                    origin,
+                    size: fragment.size,
+                    text,
+                    hard_breaks_before: 0,
                 },
             };
             x += fragment.size.width;
@@ -574,6 +1112,9 @@ fn line_ranges(
                                     IMAGE_LEN,
                                 )
                             }),
+                        MeasureItem::Custom { metrics, .. } => (hard_line.start <= item_start
+                            && item_end <= hard_line.end)
+                            .then(|| WrapLineFragment::element(metrics.width(), item.len())),
                     }
                 };
                 item_start = item_end;

@@ -14,6 +14,7 @@ mod utils;
 mod window_selection;
 
 use gpui::{App, ElementId, IntoElement, RenderOnce, SharedString, Window};
+pub use inline::{SelectableText, SelectableTextState};
 pub use markdown_ext::*;
 pub use node::TableData;
 pub use state::*;

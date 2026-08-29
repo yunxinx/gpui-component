@@ -20,6 +20,6 @@ pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument
 
     Ok(ParsedDocument {
         source: source.to_string().into(),
-        blocks,
+        blocks: blocks.into(),
     })
 }

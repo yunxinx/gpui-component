@@ -7,9 +7,9 @@ use std::{
 
 use gpui::{
     App, BorderStyle, Bounds, ClickEvent, CursorStyle, Edges, Element, ElementId, GlobalElementId,
-    Half, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
+    Half, HighlightStyle, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    SharedString, StyledText, TextLayout, Window, point, px, quad,
+    SharedString, StyledText, TextAlign, TextLayout, TextRun, Window, point, px, quad,
 };
 
 use crate::{
@@ -44,6 +44,114 @@ pub(crate) struct InlineState {
     /// The text that actually rendering, matched with selection.
     pub(super) text: SharedString,
     pub(super) selection: Option<Selection>,
+}
+
+/// Persistent state for one continuous selectable text element.
+///
+/// `SelectableTextState` is a narrow compatibility surface for applications
+/// that need to keep a code/log block's selection state across parser rebuilds.
+/// Rendering and selection remain owned by the same [`Inline`] element used by
+/// `TextView`; this type does not maintain a second text-selection system.
+#[derive(Clone, Debug, Default)]
+pub struct SelectableTextState {
+    inner: Arc<Mutex<InlineState>>,
+}
+
+impl SelectableTextState {
+    /// Create selection state initialized with the text that will be rendered.
+    pub fn new(text: impl Into<SharedString>) -> Self {
+        let state = Self::default();
+        if let Ok(mut inner) = state.inner.lock() {
+            inner.set_text(text.into());
+        }
+        state
+    }
+
+    fn set_rendered_text(&self, text: SharedString) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if inner.text != text {
+                inner.selection = None;
+                inner.set_text(text);
+            }
+        }
+    }
+
+    /// Return the selected UTF-8 text, or an empty string when nothing is selected.
+    pub fn selected_text(&self) -> String {
+        let Ok(inner) = self.inner.lock() else {
+            return String::new();
+        };
+        let Some(selection) = &inner.selection else {
+            return String::new();
+        };
+        let start = selection.start.min(selection.end).min(inner.text.len());
+        let end = selection.start.max(selection.end).min(inner.text.len());
+        inner.text.get(start..end).unwrap_or_default().to_string()
+    }
+
+    /// Clear the current selection synchronously.
+    pub fn clear_selection(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.selection = None;
+        }
+    }
+}
+
+/// One continuous selectable styled text element.
+///
+/// This wrapper deliberately delegates layout, painting, link handling, and
+/// window-level selection registration to [`Inline`]. It exists so consumers
+/// with a long homogeneous block (for example fenced code) can retain a
+/// stable state handle and optional source line-number gutter without bringing
+/// back the removed standalone selectable-text implementation.
+pub struct SelectableText {
+    inline: Inline,
+    line_number_gutter: Option<LineNumberGutter>,
+}
+
+struct LineNumberGutter {
+    right_margin: Pixels,
+    color: Hsla,
+}
+
+impl SelectableText {
+    /// Create a selectable styled text element from persistent state.
+    pub fn new(
+        id: impl Into<ElementId>,
+        state: SelectableTextState,
+        highlights: impl IntoIterator<Item = (Range<usize>, HighlightStyle)>,
+    ) -> Self {
+        Self {
+            inline: Inline::new(
+                id,
+                state.inner,
+                Vec::new(),
+                highlights.into_iter().collect(),
+                None,
+            ),
+            line_number_gutter: None,
+        }
+    }
+
+    /// Create a selectable styled text element and synchronize its rendered text.
+    pub fn with_text(
+        id: impl Into<ElementId>,
+        state: SelectableTextState,
+        text: impl Into<SharedString>,
+        highlights: impl IntoIterator<Item = (Range<usize>, HighlightStyle)>,
+    ) -> Self {
+        state.set_rendered_text(text.into());
+        Self::new(id, state, highlights)
+    }
+
+    /// Paint logical source line numbers in reserved space immediately before the text.
+    pub fn line_number_gutter(mut self, right_margin: Pixels, color: Hsla) -> Self {
+        self.line_number_gutter = Some(LineNumberGutter {
+            right_margin,
+            color,
+        });
+        self
+    }
 }
 
 impl InlineState {
@@ -581,6 +689,120 @@ impl Element for Inline {
     }
 }
 
+impl IntoElement for SelectableText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for SelectableText {
+    type RequestLayoutState = ();
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.inline.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        global_element_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        self.inline
+            .request_layout(global_element_id, inspector_id, window, cx)
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.inline
+            .prepaint(id, inspector_id, bounds, request_layout, window, cx)
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.inline.paint(
+            global_id,
+            inspector_id,
+            bounds,
+            request_layout,
+            prepaint,
+            window,
+            cx,
+        );
+
+        let Some(gutter) = &self.line_number_gutter else {
+            return;
+        };
+
+        // The layout maps byte offsets to absolute positions, so looking up
+        // each source line start paints one number per logical line while
+        // leaving soft-wrapped continuation rows blank.
+        let text_layout = self.inline.styled_text.layout();
+        let line_height = text_layout.line_height();
+        let text_style = window.text_style();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let mask_bounds = window.content_mask().bounds;
+        let mut line_start = 0;
+        let mut line_number = 1;
+        loop {
+            let Some(position) = text_layout.position_for_index(line_start) else {
+                break;
+            };
+            if position.y >= mask_bounds.bottom() {
+                break;
+            }
+            if position.y + line_height > mask_bounds.top() {
+                let number: SharedString = line_number.to_string().into();
+                let run = TextRun {
+                    len: number.len(),
+                    font: text_style.font(),
+                    color: gutter.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = window
+                    .text_system()
+                    .shape_line(number, font_size, &[run], None);
+                let origin = point(
+                    position.x - gutter.right_margin - shaped.width(),
+                    position.y,
+                );
+                let _ = shaped.paint(origin, line_height, TextAlign::Left, None, window, cx);
+            }
+
+            let Some(newline) = self.inline.text[line_start..].find('\n') else {
+                break;
+            };
+            line_start += newline + 1;
+            line_number += 1;
+        }
+    }
+}
+
 fn selection_for_multi_click(
     text: &str,
     text_layout: &TextLayout,
@@ -604,7 +826,7 @@ fn selection_for_multi_click(
 }
 
 /// Check if a `pos` is within a `bounds`, considering multi-line selections.
-fn point_in_text_selection(
+pub(super) fn point_in_text_selection(
     pos: Point<Pixels>,
     char_width: Pixels,
     selection_start: Point<Pixels>,

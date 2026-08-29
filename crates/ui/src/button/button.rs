@@ -4,6 +4,7 @@ use crate::ThemeStyled as _;
 use crate::{
     ActiveTheme, Colorize as _, Disableable, Icon, RoleOverride, Selectable, Sizable, Size,
     StyleSized, StyledExt,
+    actions::Confirm,
     button::ButtonIcon,
     h_flex,
     select::Caret,
@@ -728,6 +729,13 @@ impl RenderOnce for Button {
                 // Pressing a button must not start the window-level text selection.
                 crate::global_state::GlobalState::suppress_text_selection(cx);
             })
+        })
+        // Popover and other composite controls handle `Confirm` on an
+        // ancestor before the button's keyboard click listener runs. Capture
+        // the action here so an inert button cannot activate its parent
+        // control while loading or disabled.
+        .when(!interactive, |this| {
+            this.capture_action(|_: &Confirm, _, cx| cx.stop_propagation())
         })
         .when_some(self.on_click, |this, on_click| {
             this.on_click(move |event, window, cx| {

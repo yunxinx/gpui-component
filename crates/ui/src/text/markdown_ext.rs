@@ -13,7 +13,7 @@ use gpui::{AnyElement, App, IntoElement, SharedString, TextStyle, Window};
 use markdown::{ParseOptions, mdast};
 
 use crate::text::{
-    TextViewHeadingStyle, TextViewStyle,
+    TextViewStyle,
     inline_flow::InlineMetrics,
     node::{LinkMark, Span, TextMark},
 };
@@ -133,7 +133,6 @@ pub struct MarkdownParseContext<'a> {
 }
 
 impl<'a> MarkdownParseContext<'a> {
-    #[cfg(test)]
     pub(crate) fn new(source: &'a str, prepared_source: &'a str, offset: usize) -> Self {
         Self {
             source,
@@ -225,7 +224,7 @@ pub struct MarkdownInlineRenderContext {
     text_style: TextStyle,
     text_view_style: TextViewStyle,
     heading_level: Option<u8>,
-    heading_style: Option<TextViewHeadingStyle>,
+    heading_style: Option<HeadingStyle>,
     mark: TextMark,
     source_range: std::ops::Range<usize>,
 }
@@ -235,7 +234,7 @@ impl MarkdownInlineRenderContext {
         text_style: TextStyle,
         text_view_style: TextViewStyle,
         heading_level: Option<u8>,
-        heading_style: Option<TextViewHeadingStyle>,
+        heading_style: Option<HeadingStyle>,
         mark: TextMark,
         source_range: std::ops::Range<usize>,
     ) -> Self {
@@ -266,8 +265,8 @@ impl MarkdownInlineRenderContext {
     }
 
     /// Resolved native heading typography containing this node, if any.
-    pub fn heading_style(&self) -> Option<TextViewHeadingStyle> {
-        self.heading_style
+    pub fn heading_style(&self) -> Option<HeadingStyle> {
+        self.heading_style.clone()
     }
 
     /// Merged Markdown mark inherited by this atomic node.
@@ -284,6 +283,18 @@ impl MarkdownInlineRenderContext {
     pub fn source_range(&self) -> std::ops::Range<usize> {
         self.source_range.clone()
     }
+}
+
+/// Resolved typography for a custom inline node rendered inside a heading.
+///
+/// The upstream TextView keeps heading typography as a render-time style
+/// refinement rather than exposing a dedicated public type. This small value
+/// object lets extensions receive the same information without depending on
+/// TextView's internal layout code.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeadingStyle {
+    pub font_size: gpui::Pixels,
+    pub font_weight: gpui::FontWeight,
 }
 
 /// A custom Markdown node produced by [`MarkdownExtensions`].

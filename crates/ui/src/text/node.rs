@@ -9,7 +9,7 @@ use gpui::{
     AnyElement, App, DefiniteLength, Div, ElementId, FontStyle, FontWeight, Half, HighlightStyle,
     Hsla, InteractiveElement as _, IntoElement, Length, ObjectFit, Overflow, ParentElement,
     ScrollHandle, SharedString, SharedUri, StatefulInteractiveElement, Styled, StyledImage as _,
-    WhiteSpace, Window, div, img, prelude::FluentBuilder as _, px, relative, rems,
+    TextStyle, WhiteSpace, Window, div, img, prelude::FluentBuilder as _, px, relative, rems,
 };
 use markdown::mdast;
 use ropey::Rope;
@@ -20,10 +20,11 @@ use crate::{
     input::{InputEdit, Point, RopeExt as _},
     scroll::horizontal_scroll_area,
     text::{
-        CodeBlockActionsFn, LinkClickHandlerFn, MarkdownExtensions, MarkdownNode, TableActionsFn,
+        CodeBlockActionsFn, LinkClickHandlerFn, MarkdownExtensions, MarkdownInlineRenderContext,
+        MarkdownNode, TableActionsFn,
         document::NodeRenderOptions,
         inline::{Inline, InlineState},
-        inline_flow::{InlineFlow, InlineFlowItem},
+        inline_flow::{InlineFlow, InlineFlowItem, InlineFlowState},
         text_view::handle_link_click,
     },
     tooltip::Tooltip,
@@ -270,12 +271,58 @@ impl BlockNode {
                 }
             }
             BlockNode::Custom(node) => {
-                if let BlockTextKind::All = kind {
-                    let content = node.as_text();
-                    if !content.is_empty() {
-                        text.push_str(content);
-                        text.push('\n');
+                let content = match kind {
+                    BlockTextKind::All => node.as_text().to_string(),
+                    BlockTextKind::Selected | BlockTextKind::SelectedSource => {
+                        let mut selected = String::new();
+                        if let Some(breaks_before) = node.attached_inline_flow_breaks_before() {
+                            let mut has_selected = false;
+                            let mut pending_breaks = 0;
+                            for (state_ix, state) in
+                                node.attached_inline_flow_states().iter().enumerate()
+                            {
+                                let fragment = state.selected_text();
+                                if has_selected {
+                                    pending_breaks +=
+                                        breaks_before.get(state_ix).copied().unwrap_or(1);
+                                }
+                                if fragment.is_empty() {
+                                    continue;
+                                }
+                                if has_selected {
+                                    selected.extend(std::iter::repeat_n('\n', pending_breaks));
+                                }
+                                selected.push_str(&fragment);
+                                has_selected = true;
+                                pending_breaks = 0;
+                            }
+                        } else {
+                            for state in node.attached_inline_flow_states() {
+                                let fragment = state.selected_text();
+                                if fragment.is_empty() {
+                                    continue;
+                                }
+                                if !selected.is_empty() {
+                                    selected.push('\n');
+                                }
+                                selected.push_str(&fragment);
+                            }
+                        }
+                        if let Some(state) = node.attached_selectable_text_state() {
+                            let fragment = state.selected_text();
+                            if !fragment.is_empty() {
+                                if !selected.is_empty() {
+                                    selected.push('\n');
+                                }
+                                selected.push_str(&fragment);
+                            }
+                        }
+                        selected
                     }
+                };
+                if !content.is_empty() {
+                    text.push_str(&content);
+                    text.push('\n');
                 }
             }
             BlockNode::Definition { .. }
@@ -322,8 +369,15 @@ impl BlockNode {
                     .any(|cell| cell.children.has_selection())
             }),
             BlockNode::CodeBlock(code_block) => code_block.has_selection(),
-            BlockNode::Custom { .. }
-            | BlockNode::Definition { .. }
+            BlockNode::Custom(node) => {
+                node.attached_inline_flow_states()
+                    .iter()
+                    .any(|state| !state.selected_text().is_empty())
+                    || node
+                        .attached_selectable_text_state()
+                        .is_some_and(|state| !state.selected_text().is_empty())
+            }
+            BlockNode::Definition { .. }
             | BlockNode::Break { .. }
             | BlockNode::HorizontalRule { .. }
             | BlockNode::Unknown { .. } => false,
@@ -350,8 +404,15 @@ impl BlockNode {
                 }
             }
             BlockNode::CodeBlock(code_block) => code_block.clear_selection(),
-            BlockNode::Custom { .. }
-            | BlockNode::Definition { .. }
+            BlockNode::Custom(node) => {
+                for state in node.attached_inline_flow_states() {
+                    state.clear_selection();
+                }
+                if let Some(state) = node.attached_selectable_text_state() {
+                    state.clear_selection();
+                }
+            }
+            BlockNode::Definition { .. }
             | BlockNode::Break { .. }
             | BlockNode::HorizontalRule { .. }
             | BlockNode::Unknown { .. } => {}
@@ -434,6 +495,73 @@ impl TextMark {
     }
 }
 
+fn resolve_text_mark(mark: &TextMark, node_cx: &NodeContext) -> TextMark {
+    let mut resolved = mark.clone();
+    if let Some(link) = resolved.link.as_mut()
+        && let Some(identifier) = link.identifier.as_ref()
+        && let Some(reference) = node_cx.link_refs.get(identifier)
+    {
+        *link = reference.clone();
+    }
+    resolved
+}
+
+fn highlight_for_mark(mark: &TextMark, node_cx: &NodeContext, cx: &App) -> HighlightStyle {
+    let mut highlight = HighlightStyle::default();
+    if mark.bold {
+        highlight.font_weight = Some(FontWeight::BOLD);
+    }
+    if mark.italic {
+        highlight.font_style = Some(FontStyle::Italic);
+    }
+    if mark.strikethrough {
+        highlight.strikethrough = Some(gpui::StrikethroughStyle {
+            thickness: px(1.),
+            ..Default::default()
+        });
+    }
+    if mark.underline {
+        highlight.underline = Some(gpui::UnderlineStyle {
+            thickness: px(1.),
+            ..Default::default()
+        });
+    }
+    if mark.code {
+        highlight = highlight.highlight(node_cx.style.inline_code_highlight(cx));
+    }
+    if let Some(color) = mark.highlight {
+        highlight.background_color = Some(color);
+    }
+    if mark.link.is_some() {
+        highlight.color = Some(cx.theme().link);
+        highlight.underline = Some(gpui::UnderlineStyle {
+            thickness: px(1.),
+            ..Default::default()
+        });
+    }
+    highlight
+}
+
+fn flush_inline_flow_text(
+    items: &mut Vec<InlineFlowItem>,
+    text: &mut String,
+    highlights: &mut Vec<(Range<usize>, HighlightStyle)>,
+    links: &mut Vec<(Range<usize>, LinkMark)>,
+    state: Option<Arc<Mutex<InlineState>>>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    items.push(
+        InlineFlowItem::text_with_state(
+            std::mem::take(text),
+            state.unwrap_or_else(|| Arc::new(Mutex::new(InlineState::default()))),
+        )
+        .with_links(std::mem::take(links))
+        .highlights(std::mem::take(highlights)),
+    );
+}
+
 /// The bytes
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 pub struct Span {
@@ -465,6 +593,34 @@ impl ImageNode {
             .unwrap_or_else(|| self.alt.clone().unwrap_or_default())
             .to_string()
     }
+
+    pub(crate) fn resolved_url(
+        &self,
+        reference_identifier: Option<&SharedString>,
+        node_cx: &NodeContext,
+    ) -> SharedUri {
+        reference_identifier
+            .and_then(|identifier| node_cx.link_refs.get(identifier))
+            .map(|reference| reference.url.clone().into())
+            .unwrap_or_else(|| self.url.clone())
+    }
+
+    pub(crate) fn resolved_title(
+        &self,
+        reference_identifier: Option<&SharedString>,
+        node_cx: &NodeContext,
+    ) -> String {
+        let Some(reference) =
+            reference_identifier.and_then(|identifier| node_cx.link_refs.get(identifier))
+        else {
+            return self.title();
+        };
+        reference
+            .title
+            .clone()
+            .unwrap_or_else(|| self.alt.clone().unwrap_or_default())
+            .to_string()
+    }
 }
 
 impl PartialEq for ImageNode {
@@ -483,6 +639,8 @@ pub(crate) struct InlineNode {
     /// The text content.
     pub(crate) text: SharedString,
     pub(crate) image: Option<ImageNode>,
+    pub(crate) image_reference_identifier: Option<SharedString>,
+    pub(crate) custom: Option<MarkdownNode>,
     /// The text styles, each tuple contains the range of the text and the style.
     pub(crate) marks: Vec<(Range<usize>, TextMark)>,
 
@@ -491,7 +649,11 @@ pub(crate) struct InlineNode {
 
 impl PartialEq for InlineNode {
     fn eq(&self, other: &Self) -> bool {
-        self.text == other.text && self.image == other.image && self.marks == other.marks
+        self.text == other.text
+            && self.image == other.image
+            && self.image_reference_identifier == other.image_reference_identifier
+            && self.custom == other.custom
+            && self.marks == other.marks
     }
 }
 
@@ -594,9 +756,14 @@ fn emit_run(
     selected
 }
 
-/// The Markdown source for an inline image, e.g. `![alt](url "title")`.
-fn image_markdown(image: &ImageNode) -> String {
+/// The Markdown source for an inline image, e.g. `![alt](url "title")` or
+/// `![alt][reference]` when the image came from a reference definition.
+fn image_markdown(image: &ImageNode, reference_identifier: Option<&SharedString>) -> String {
     let alt = image.alt.clone().unwrap_or_default();
+    if let Some(identifier) = reference_identifier {
+        return format!("![{alt}][{identifier}]");
+    }
+
     let title = image
         .title
         .clone()
@@ -790,6 +957,8 @@ impl InlineNode {
         Self {
             text: text.into(),
             image: None,
+            image_reference_identifier: None,
+            custom: None,
             marks: vec![],
             state: Arc::new(Mutex::new(InlineState::default())),
         }
@@ -801,9 +970,33 @@ impl InlineNode {
         this
     }
 
+    pub(crate) fn reference_image(image: ImageNode, identifier: SharedString) -> Self {
+        let mut this = Self::image(image);
+        this.image_reference_identifier = Some(identifier);
+        this
+    }
+
+    pub(crate) fn custom(custom: MarkdownNode) -> Self {
+        let mut this = Self::new(custom.as_text().to_string());
+        this.custom = Some(custom);
+        this
+    }
+
     pub(crate) fn marks(mut self, marks: Vec<(Range<usize>, TextMark)>) -> Self {
         self.marks = marks;
         self
+    }
+
+    pub(crate) fn merge_full_mark(&mut self, mark: TextMark) {
+        let len = self.text.len();
+        if let Some(last) = self.marks.last_mut()
+            && last.0.start == 0
+            && last.0.end == len
+        {
+            last.1.merge(mark);
+        } else if len > 0 {
+            self.marks.push((0..len, mark));
+        }
     }
 }
 
@@ -821,6 +1014,7 @@ pub(crate) struct Paragraph {
     pub(super) link_refs: HashMap<SharedString, SharedString>,
 
     pub(crate) state: Arc<Mutex<InlineState>>,
+    pub(crate) flow_state: InlineFlowState,
 }
 
 impl PartialEq for Paragraph {
@@ -838,10 +1032,15 @@ impl Paragraph {
             children: vec![InlineNode::new(&text)],
             link_refs: HashMap::new(),
             state: Arc::new(Mutex::new(InlineState::default())),
+            flow_state: InlineFlowState::default(),
         }
     }
 
     pub(super) fn selected_text(&self) -> String {
+        if self.should_render_inline_flow() {
+            let selected = self.flow_state.selected_text();
+            return selected;
+        }
         let mut text = String::new();
 
         for c in self.children.iter() {
@@ -902,7 +1101,10 @@ impl Paragraph {
                 enters_image = selected.emitted && selected.at_end;
             }
             if enters_image {
-                pending_images.push(image_markdown(image));
+                pending_images.push(image_markdown(
+                    image,
+                    child.image_reference_identifier.as_ref(),
+                ));
             } else {
                 pending_images.clear();
             }
@@ -932,6 +1134,10 @@ impl Paragraph {
     ///
     /// Mirrors the [`selected_text`](Self::selected_text) traversal.
     pub(super) fn has_selection(&self) -> bool {
+        if self.should_render_inline_flow() {
+            let selected = self.flow_state.selected_text();
+            return !selected.is_empty();
+        }
         self.children
             .iter()
             .any(|c| c.state.lock().is_ok_and(|state| state.selection.is_some()))
@@ -942,6 +1148,10 @@ impl Paragraph {
     }
 
     pub(super) fn clear_selection(&self) {
+        if self.should_render_inline_flow() {
+            self.flow_state.clear_selection();
+            return;
+        }
         for c in self.children.iter() {
             if let Ok(mut state) = c.state.lock() {
                 state.selection = None;
@@ -1087,6 +1297,7 @@ impl Paragraph {
                 children: vec![],
                 link_refs: Default::default(),
                 state: Arc::new(Mutex::new(InlineState::default())),
+                flow_state: InlineFlowState::default(),
             },
         )
     }
@@ -1111,6 +1322,11 @@ impl Paragraph {
 
     pub(crate) fn push_image(&mut self, image: ImageNode) {
         self.children.push(InlineNode::image(image));
+    }
+
+    pub(crate) fn push_reference_image(&mut self, image: ImageNode, identifier: SharedString) {
+        self.children
+            .push(InlineNode::reference_image(image, identifier));
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -1380,16 +1596,24 @@ impl PartialEq for NodeContext {
 }
 
 impl Paragraph {
-    fn render(&self, node_cx: &NodeContext, _window: &mut Window, cx: &mut App) -> AnyElement {
+    fn render(
+        &self,
+        node_cx: &NodeContext,
+        heading_level: Option<u8>,
+        text_color: Option<Hsla>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
         let span = self.span;
         let children = &self.children;
 
         if self.should_render_inline_flow() {
             return InlineFlow::new(
                 span.unwrap_or_default(),
-                self.inline_flow_items(node_cx, cx),
-                node_cx.link_click_handler.clone(),
+                self.flow_state.clone(),
+                self.inline_flow_items(node_cx, heading_level, text_color, window, cx),
             )
+            .with_link_click_handler(node_cx.link_click_handler.clone())
             .into_any_element();
         }
 
@@ -1421,15 +1645,19 @@ impl Paragraph {
                         .into_any_element(),
                     );
                 }
+                let resolved_url =
+                    image.resolved_url(inline_node.image_reference_identifier.as_ref(), node_cx);
+                let resolved_title =
+                    image.resolved_title(inline_node.image_reference_identifier.as_ref(), node_cx);
                 let link_click_handler = node_cx.link_click_handler.clone();
                 child_nodes.push(
-                    img(image_source(&image.url))
+                    img(image_source(&resolved_url))
                         .id(ix)
                         .object_fit(ObjectFit::Contain)
                         .max_w(relative(1.))
                         .when_some(image.width, |this, width| this.w(width))
                         .when_some(image.link.clone(), |this, link| {
-                            let title = image.title();
+                            let title = resolved_title;
                             let link_click_handler = link_click_handler.clone();
                             let aux_link = link.clone();
                             let aux_link_click_handler = link_click_handler.clone();
@@ -1550,111 +1778,153 @@ impl Paragraph {
     fn should_render_inline_flow(&self) -> bool {
         let has_image = self.children.iter().any(|child| child.image.is_some());
         let has_text = self.children.iter().any(|child| !child.text.is_empty());
-        has_image && has_text
+        let has_custom = self.children.iter().any(|child| child.custom.is_some());
+        has_custom || (has_image && has_text)
     }
 
-    fn inline_flow_items(&self, node_cx: &NodeContext, cx: &mut App) -> Vec<InlineFlowItem> {
+    fn inline_flow_items(
+        &self,
+        node_cx: &NodeContext,
+        heading_level: Option<u8>,
+        text_color: Option<Hsla>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<InlineFlowItem> {
         let mut items = Vec::new();
         let mut text = String::new();
         let mut highlights: Vec<(Range<usize>, HighlightStyle)> = vec![];
         let mut links: Vec<(Range<usize>, LinkMark)> = vec![];
         let mut offset = 0;
+        let mut text_state: Option<Arc<Mutex<InlineState>>> = None;
 
         for inline_node in &self.children {
-            let text_len = inline_node.text.len();
-            text.push_str(&inline_node.text);
-
             if let Some(image) = &inline_node.image {
-                if !text.is_empty() {
-                    if let Ok(mut state) = inline_node.state.lock() {
-                        state.set_text(text.clone().into());
-                    }
-                    items.push(InlineFlowItem::Text {
-                        state: inline_node.state.clone(),
-                        text: text.clone().into(),
-                        links: links.clone(),
-                        highlights: highlights.clone(),
-                    });
-                }
-
-                items.push(InlineFlowItem::Image {
-                    url: image.url.clone(),
-                    link: image.link.clone(),
-                    title: image.title(),
-                    width: image.width,
-                    height: image.height,
-                });
-
-                text.clear();
-                links.clear();
-                highlights.clear();
+                // The image node owns the state for the text run immediately
+                // before it. This is also the state used by source-format
+                // reconstruction in `Paragraph::selected_source`.
+                flush_inline_flow_text(
+                    &mut items,
+                    &mut text,
+                    &mut highlights,
+                    &mut links,
+                    Some(inline_node.state.clone()),
+                );
+                let url =
+                    image.resolved_url(inline_node.image_reference_identifier.as_ref(), node_cx);
+                let title =
+                    image.resolved_title(inline_node.image_reference_identifier.as_ref(), node_cx);
+                items.push(
+                    InlineFlowItem::image(url, title, image.width, image.height)
+                        .with_image_link_mark(image.link.clone()),
+                );
                 offset = 0;
-            } else {
-                let mut node_highlights = vec![];
-                for (range, style) in &inline_node.marks {
-                    let inner_range = (offset + range.start)..(offset + range.end);
+                text_state = None;
+                continue;
+            }
 
-                    let mut highlight = HighlightStyle::default();
-                    if style.bold {
-                        highlight.font_weight = Some(FontWeight::BOLD);
-                    }
-                    if style.italic {
-                        highlight.font_style = Some(FontStyle::Italic);
-                    }
-                    if style.strikethrough {
-                        highlight.strikethrough = Some(gpui::StrikethroughStyle {
-                            thickness: gpui::px(1.),
-                            ..Default::default()
-                        });
-                    }
-                    if style.underline {
-                        highlight.underline = Some(gpui::UnderlineStyle {
-                            thickness: gpui::px(1.),
-                            ..Default::default()
-                        });
-                    }
-                    if style.code {
-                        highlight = highlight.highlight(node_cx.style.inline_code_highlight(cx));
-                    }
-                    if let Some(color) = style.highlight {
-                        highlight.background_color = Some(color);
-                    }
+            if let Some(custom) = &inline_node.custom {
+                flush_inline_flow_text(
+                    &mut items,
+                    &mut text,
+                    &mut highlights,
+                    &mut links,
+                    text_state.take(),
+                );
+                offset = 0;
 
-                    if let Some(mut link_mark) = style.link.clone() {
-                        highlight.color = Some(cx.theme().link);
-                        highlight.underline = Some(gpui::UnderlineStyle {
-                            thickness: gpui::px(1.),
-                            ..Default::default()
-                        });
-
-                        if let Some(identifier) = link_mark.identifier.as_ref()
-                            && let Some(mark) = node_cx.link_refs.get(identifier)
-                        {
-                            link_mark = mark.clone();
-                        }
-
-                        links.push((inner_range.clone(), link_mark));
-                    }
-
-                    node_highlights.push((inner_range, highlight));
+                let mut mark = TextMark::default();
+                for (_, child_mark) in &inline_node.marks {
+                    mark.merge(child_mark.clone());
                 }
+                let mark = resolve_text_mark(&mark, node_cx);
+                let highlight = highlight_for_mark(&mark, node_cx, cx);
+                let heading_style = heading_level.map(|level| {
+                    let (size, weight) = match level {
+                        1 => (rems(2.), FontWeight::BOLD),
+                        2 => (rems(1.5), FontWeight::SEMIBOLD),
+                        3 => (rems(1.25), FontWeight::SEMIBOLD),
+                        4 => (rems(1.125), FontWeight::SEMIBOLD),
+                        5 => (rems(1.), FontWeight::SEMIBOLD),
+                        6 => (rems(1.), FontWeight::MEDIUM),
+                        _ => (rems(1.), FontWeight::NORMAL),
+                    };
+                    let font_size = node_cx.style.heading_font_size.as_ref().map_or_else(
+                        || size.to_pixels(node_cx.style.heading_base_font_size),
+                        |callback| callback(level, node_cx.style.heading_base_font_size),
+                    );
+                    super::HeadingStyle {
+                        font_size,
+                        font_weight: weight,
+                    }
+                });
+                let mut text_style: TextStyle = window.text_style();
+                if let Some(heading) = heading_style {
+                    text_style.font_size = heading.font_size.into();
+                    text_style.font_weight = heading.font_weight;
+                }
+                if let Some(text_color) = text_color {
+                    text_style.color = text_color;
+                }
+                text_style = text_style.highlight(highlight);
 
-                highlights = gpui::combine_highlights(highlights, node_highlights).collect();
-                offset += text_len;
+                let span = custom.span.or(self.span).unwrap_or_default();
+                let context = MarkdownInlineRenderContext::new(
+                    text_style,
+                    node_cx.style.clone(),
+                    heading_level,
+                    heading_style,
+                    mark.clone(),
+                    span.start..span.end,
+                );
+                if let Some(rendered) = node_cx
+                    .markdown_extensions
+                    .render_inline(custom, &context, window, cx)
+                {
+                    let (metrics, element) = rendered.into_parts();
+                    items.push(
+                        InlineFlowItem::custom(custom.as_text().to_string(), metrics, element)
+                            .with_custom_link_mark(mark.link),
+                    );
+                } else {
+                    let text_len = inline_node.text.len();
+                    let fallback_links = mark
+                        .link
+                        .map(|link| vec![(0..text_len, link)])
+                        .unwrap_or_default();
+                    items.push(
+                        InlineFlowItem::text(inline_node.text.clone())
+                            .with_links(fallback_links)
+                            .highlights(vec![(0..text_len, highlight)]),
+                    );
+                }
+                continue;
             }
+
+            let text_len = inline_node.text.len();
+            if text_state.is_none() {
+                text_state = Some(inline_node.state.clone());
+            }
+            text.push_str(&inline_node.text);
+            let mut node_highlights = vec![];
+            for (range, style) in &inline_node.marks {
+                let inner_range = (offset + range.start)..(offset + range.end);
+                let resolved = resolve_text_mark(style, node_cx);
+                if let Some(link) = resolved.link.clone() {
+                    links.push((inner_range.clone(), link));
+                }
+                node_highlights.push((inner_range, highlight_for_mark(&resolved, node_cx, cx)));
+            }
+            highlights = gpui::combine_highlights(highlights, node_highlights).collect();
+            offset += text_len;
         }
 
-        if !text.is_empty() {
-            if let Ok(mut state) = self.state.lock() {
-                state.set_text(text.clone().into());
-            }
-            items.push(InlineFlowItem::Text {
-                state: self.state.clone(),
-                text: text.into(),
-                links,
-                highlights,
-            });
-        }
+        flush_inline_flow_text(
+            &mut items,
+            &mut text,
+            &mut highlights,
+            &mut links,
+            Some(self.state.clone()),
+        );
 
         items
     }
@@ -1666,7 +1936,10 @@ impl Paragraph {
             .children
             .iter()
             .map(|text_node| {
-                let mut text = text_node.text.to_string();
+                let mut text = text_node
+                    .custom
+                    .as_ref()
+                    .map_or_else(|| text_node.text.to_string(), MarkdownNode::to_markdown);
                 for (range, style) in &text_node.marks {
                     if style.bold {
                         text = format!("**{}**", &text_node.text[range.clone()]);
@@ -1689,12 +1962,10 @@ impl Paragraph {
                 }
 
                 if let Some(image) = &text_node.image {
-                    let alt = image.alt.clone().unwrap_or_default();
-                    let title = image
-                        .title
-                        .clone()
-                        .map_or(String::new(), |t| format!(" \"{}\"", t));
-                    text.push_str(&format!("![{}]({}{})", alt, image.url, title))
+                    text.push_str(&image_markdown(
+                        image,
+                        text_node.image_reference_identifier.as_ref(),
+                    ));
                 }
 
                 text
@@ -2152,7 +2423,7 @@ impl BlockNode {
                             this.border_r_1().border_color(cx.theme().table_row_border)
                         })
                         .refine_style(&style.table_cell)
-                        .child(cell.children.render(node_cx, window, cx)),
+                        .child(cell.children.render(node_cx, None, None, window, cx)),
                 );
             }
             rows.push(
@@ -2258,7 +2529,7 @@ impl BlockNode {
                             this.border_r_1().border_color(cx.theme().table_row_border)
                         })
                         .refine_style(&style.table_cell)
-                        .child(cell.children.render(node_cx, window, cx)),
+                        .child(cell.children.render(node_cx, None, None, window, cx)),
                 );
             }
 
@@ -2337,7 +2608,7 @@ impl BlockNode {
             BlockNode::Paragraph(paragraph) => div()
                 .id(("p", ix))
                 .pb(mb)
-                .child(paragraph.render(node_cx, window, cx))
+                .child(paragraph.render(node_cx, None, None, window, cx))
                 .into_any_element(),
             BlockNode::Heading {
                 level, children, ..
@@ -2363,7 +2634,7 @@ impl BlockNode {
                     .whitespace_normal()
                     .text_size(text_size)
                     .font_weight(font_weight)
-                    .child(children.render(node_cx, window, cx))
+                    .child(children.render(node_cx, Some(*level), None, window, cx))
                     .into_any_element()
             }
             BlockNode::Blockquote { children, .. } => div()
@@ -2513,6 +2784,7 @@ mod tests {
             children,
             link_refs: HashMap::new(),
             state: Arc::new(Mutex::new(InlineState::default())),
+            flow_state: InlineFlowState::default(),
         };
         if let Ok(mut state) = paragraph.state.lock() {
             state.set_text(combined.into());
@@ -2857,6 +3129,7 @@ mod tests {
             children: vec![InlineNode::image(image)],
             link_refs: HashMap::new(),
             state: Arc::new(Mutex::new(InlineState::default())),
+            flow_state: InlineFlowState::default(),
         }
     }
 
@@ -2886,6 +3159,30 @@ mod tests {
             })),
             "[x](https://example.com \"Tip\")"
         );
+    }
+
+    #[test]
+    fn reference_image_reconstruction_keeps_reference_syntax() {
+        let image = ImageNode {
+            url: "https://example.com/image.png".into(),
+            title: Some("ignored for reference syntax".into()),
+            alt: Some("diagram".into()),
+            ..Default::default()
+        };
+        let identifier: SharedString = "diagram-ref".into();
+
+        assert_eq!(
+            image_markdown(&image, Some(&identifier)),
+            "![diagram][diagram-ref]"
+        );
+        assert_eq!(
+            image_markdown(&image, None),
+            "![diagram](https://example.com/image.png \"ignored for reference syntax\")"
+        );
+
+        let mut paragraph = Paragraph::default();
+        paragraph.push_reference_image(image, identifier);
+        assert_eq!(paragraph.to_markdown(), "![diagram][diagram-ref]\n\n");
     }
 
     /// A block the selection covers whole comes straight from the source, so it
