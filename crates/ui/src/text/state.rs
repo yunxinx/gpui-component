@@ -139,6 +139,15 @@ impl TextViewState {
         Self::new(TextViewFormat::Markdown, text, cx)
     }
 
+    /// Create a Markdown state whose first parse and block measurement are
+    /// deferred until the owning view has installed its extensions.
+    ///
+    /// This is a narrow compatibility entry point for streaming consumers that
+    /// register custom Markdown nodes immediately after creating the state.
+    pub fn markdown_with_lazy_scroll_measurement(text: &str, cx: &mut Context<Self>) -> Self {
+        Self::new_with_options(TextViewFormat::Markdown, text, false, cx)
+    }
+
     /// Create a HTML TextViewState.
     pub fn html(text: &str, cx: &mut Context<Self>) -> Self {
         Self::new(TextViewFormat::Html, text, cx)
@@ -146,6 +155,15 @@ impl TextViewState {
 
     /// Create a new TextViewState.
     fn new(format: TextViewFormat, text: &str, cx: &mut Context<Self>) -> Self {
+        Self::new_with_options(format, text, true, cx)
+    }
+
+    fn new_with_options(
+        format: TextViewFormat,
+        text: &str,
+        eager_scroll_measurement: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         let selection_adapter = TextViewSelectionAdapter::new(cx.entity().downgrade(), cx);
 
@@ -203,7 +221,11 @@ impl TextViewState {
             // thumb size stays stable. Without this, off-screen blocks count
             // as zero height until scrolled into view, which makes the
             // scrollbar jitter as more blocks get measured during scrolling.
-            list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)).measure_all(),
+            list_state: if eager_scroll_measurement {
+                ListState::new(0, gpui::ListAlignment::Top, px(1000.)).measure_all()
+            } else {
+                ListState::new(0, gpui::ListAlignment::Top, px(1000.))
+            },
             text_view_style: TextViewStyle::default(),
             code_block_actions: None,
             table_actions: None,
@@ -223,7 +245,11 @@ impl TextViewState {
             _parse_task,
             _receive_task,
         };
-        this.increment_update(&text, false, cx);
+        if eager_scroll_measurement {
+            this.increment_update(&text, false, cx);
+        } else {
+            this.queue_initial_parse(&text);
+        }
         this
     }
 
@@ -414,6 +440,18 @@ impl TextViewState {
         }
 
         _ = self.tx.try_send(update_options);
+    }
+
+    fn queue_initial_parse(&mut self, text: &str) {
+        self.revision += 1;
+        self.selection_revision = self.selection_revision.wrapping_add(1);
+        _ = self.tx.try_send(UpdateOptions {
+            revision: self.revision,
+            append: false,
+            mode: ParseMode::Replace,
+            pending_text: text.to_string(),
+            markdown_extensions: self.markdown_extensions.clone(),
+        });
     }
 
     /// Save bounds and unselect if bounds changed.
