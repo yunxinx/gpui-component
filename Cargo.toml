@@ -46,11 +46,11 @@ story = { path = "crates/story" }
 # Keep every GPUI workspace crate on the same Nostra fork revision. The Zed
 # fork's `nostra` branch carries the Unicode wrapping and test-window fixes
 # required by this component fork.
-gpui = { version = "0.2.2", git = "https://github.com/yunxinx/zed.git", rev = "264bb4455d462451315328a9e2bdec2a57d7f086" }
-gpui_platform = { git = "https://github.com/yunxinx/zed.git", rev = "264bb4455d462451315328a9e2bdec2a57d7f086", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-gpui_web = { git = "https://github.com/yunxinx/zed.git", rev = "264bb4455d462451315328a9e2bdec2a57d7f086" }
-gpui_macros = { version = "0.1.0", git = "https://github.com/yunxinx/zed.git", rev = "264bb4455d462451315328a9e2bdec2a57d7f086" }
-reqwest_client = { git = "https://github.com/yunxinx/zed.git", rev = "264bb4455d462451315328a9e2bdec2a57d7f086" }
+gpui = { version = "0.2.2", git = "https://github.com/yunxinx/zed.git", rev = "13e725c42f723f81c87231cb65459eeb561b5f6a" }
+gpui_platform = { git = "https://github.com/yunxinx/zed.git", rev = "13e725c42f723f81c87231cb65459eeb561b5f6a", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui_web = { git = "https://github.com/yunxinx/zed.git", rev = "13e725c42f723f81c87231cb65459eeb561b5f6a" }
+gpui_macros = { version = "0.1.0", git = "https://github.com/yunxinx/zed.git", rev = "13e725c42f723f81c87231cb65459eeb561b5f6a" }
+reqwest_client = { git = "https://github.com/yunxinx/zed.git", rev = "13e725c42f723f81c87231cb65459eeb561b5f6a" }
 sum-tree = { version = "0.2.0", package = "zed-sum-tree" }
 # reqwest = { version = "0.12.15-zed", package = "zed-reqwest" }
 reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "c15662463bda39148ba154100dd44d3fba5873a4", default-features = false, features = [
