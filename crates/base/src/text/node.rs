@@ -537,6 +537,27 @@ fn highlight_for_mark(mark: &TextMark, node_cx: &NodeContext) -> HighlightStyle 
     highlight
 }
 
+/// Typography of a Markdown heading at `level`, honoring the style's explicit
+/// per-level font size when configured.
+fn heading_style(level: u8, style: &TextViewStyle) -> super::HeadingStyle {
+    let (size, font_weight) = match level {
+        1 => (rems(2.), FontWeight::BOLD),
+        2 => (rems(1.5), FontWeight::SEMIBOLD),
+        3 => (rems(1.25), FontWeight::SEMIBOLD),
+        4 => (rems(1.125), FontWeight::SEMIBOLD),
+        5 => (rems(1.), FontWeight::SEMIBOLD),
+        6 => (rems(1.), FontWeight::MEDIUM),
+        _ => (rems(1.), FontWeight::NORMAL),
+    };
+    let font_size = style
+        .heading_font_size(level)
+        .unwrap_or_else(|| size.to_pixels(style.heading_base_font_size()));
+    super::HeadingStyle {
+        font_size,
+        font_weight,
+    }
+}
+
 fn flush_inline_flow_text(
     items: &mut Vec<InlineFlowItem>,
     text: &mut String,
@@ -1806,25 +1827,7 @@ impl Paragraph {
                 }
                 let mark = resolve_text_mark(&mark, node_cx);
                 let highlight = highlight_for_mark(&mark, node_cx);
-                let heading_style = heading_level.map(|level| {
-                    let (size, weight) = match level {
-                        1 => (rems(2.), FontWeight::BOLD),
-                        2 => (rems(1.5), FontWeight::SEMIBOLD),
-                        3 => (rems(1.25), FontWeight::SEMIBOLD),
-                        4 => (rems(1.125), FontWeight::SEMIBOLD),
-                        5 => (rems(1.), FontWeight::SEMIBOLD),
-                        6 => (rems(1.), FontWeight::MEDIUM),
-                        _ => (rems(1.), FontWeight::NORMAL),
-                    };
-                    let font_size = node_cx
-                        .style
-                        .heading_font_size(level)
-                        .unwrap_or_else(|| size.to_pixels(node_cx.style.heading_base_font_size()));
-                    super::HeadingStyle {
-                        font_size,
-                        font_weight: weight,
-                    }
-                });
+                let heading_style = heading_level.map(|level| heading_style(level, &node_cx.style));
                 let mut text_style: TextStyle = window.text_style();
                 if let Some(heading) = heading_style {
                     text_style.font_size = heading.font_size.into();
@@ -2417,7 +2420,10 @@ impl BlockNode {
                             this.border_r_1().border_color(style.border())
                         })
                         .refine_style(style.table_cell())
-                        .child(cell.children.render(node_cx, None, None, window, cx)),
+                        .child(
+                            cell.children
+                                .render(node_cx, None, options.text_color, window, cx),
+                        ),
                 );
             }
             rows.push(
@@ -2525,7 +2531,10 @@ impl BlockNode {
                             this.border_r_1().border_color(style.border())
                         })
                         .refine_style(style.table_cell())
-                        .child(cell.children.render(node_cx, None, None, window, cx)),
+                        .child(
+                            cell.children
+                                .render(node_cx, None, options.text_color, window, cx),
+                        ),
                 );
             }
 
@@ -2603,55 +2612,56 @@ impl BlockNode {
             BlockNode::Paragraph(paragraph) => div()
                 .id(("p", ix))
                 .pb(mb)
-                .child(paragraph.render(node_cx, None, None, window, cx))
+                .child(paragraph.render(node_cx, None, options.text_color, window, cx))
                 .into_any_element(),
             BlockNode::Heading {
                 level, children, ..
             } => {
-                let (text_size, font_weight) = match level {
-                    1 => (rems(2.), FontWeight::BOLD),
-                    2 => (rems(1.5), FontWeight::SEMIBOLD),
-                    3 => (rems(1.25), FontWeight::SEMIBOLD),
-                    4 => (rems(1.125), FontWeight::SEMIBOLD),
-                    5 => (rems(1.), FontWeight::SEMIBOLD),
-                    6 => (rems(1.), FontWeight::MEDIUM),
-                    _ => (rems(1.), FontWeight::NORMAL),
-                };
-
-                let mut text_size = text_size.to_pixels(node_cx.style.heading_base_font_size());
-                if let Some(size) = node_cx.style.heading_font_size(*level) {
-                    text_size = size;
-                }
+                let heading = heading_style(*level, &node_cx.style);
 
                 div()
                     .id(SharedString::from(format!("h{}-{}", level, ix)))
                     .pb(rems(0.3))
                     .whitespace_normal()
-                    .text_size(text_size)
-                    .font_weight(font_weight)
-                    .child(children.render(node_cx, Some(*level), None, window, cx))
+                    .text_size(heading.font_size)
+                    .font_weight(heading.font_weight)
+                    .child(children.render(node_cx, Some(*level), options.text_color, window, cx))
                     .into_any_element()
             }
-            BlockNode::Blockquote { children, .. } => div()
-                .w_full()
-                .pb(mb)
-                .child(
-                    div()
-                        .id(("blockquote", ix))
-                        .w_full()
-                        .text_color(node_cx.style.muted_foreground())
-                        .border_l_3()
-                        .border_color(node_cx.style.border())
-                        .px_4()
-                        .children({
-                            let children_len = children.len();
-                            children.into_iter().enumerate().map(move |(index, c)| {
-                                let is_last = index == children_len - 1;
-                                c.render_block(options.is_last(is_last), node_cx, window, cx)
-                            })
-                        }),
-                )
-                .into_any_element(),
+            BlockNode::Blockquote { children, .. } => {
+                // Custom inline items build their render context while the
+                // element tree is constructed, before this div's text color is
+                // in effect, so the muted color must travel with the options.
+                let text_color = node_cx.style.muted_foreground();
+                div()
+                    .w_full()
+                    .pb(mb)
+                    .child(
+                        div()
+                            .id(("blockquote", ix))
+                            .w_full()
+                            .text_color(text_color)
+                            .border_l_3()
+                            .border_color(node_cx.style.border())
+                            .px_4()
+                            .children({
+                                let children_len = children.len();
+                                children.into_iter().enumerate().map(move |(index, c)| {
+                                    let is_last = index == children_len - 1;
+                                    c.render_block(
+                                        NodeRenderOptions {
+                                            text_color: Some(text_color),
+                                            ..options.is_last(is_last)
+                                        },
+                                        node_cx,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                            }),
+                    )
+                    .into_any_element()
+            }
             BlockNode::List {
                 children, ordered, ..
             } => v_flex()
@@ -2692,7 +2702,21 @@ impl BlockNode {
                     None => div().child(node.as_text().to_string()).into_any_element(),
                 };
 
-                div().pb(mb).child(inner).into_any_element()
+                // A custom block that replaces a native heading keeps the
+                // heading's typography and spacing around the plugin element.
+                if let Some(level) = node.heading_level() {
+                    let heading = heading_style(level, &node_cx.style);
+                    div()
+                        .id(SharedString::from(format!("h{}-{}", level, ix)))
+                        .pb(rems(0.3))
+                        .whitespace_normal()
+                        .text_size(heading.font_size)
+                        .font_weight(heading.font_weight)
+                        .child(inner)
+                        .into_any_element()
+                } else {
+                    div().pb(mb).child(inner).into_any_element()
+                }
             }
             BlockNode::Table { .. } => {
                 Self::render_table(self, &options, node_cx, window, cx).into_any_element()
@@ -2722,6 +2746,26 @@ impl BlockNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heading_style_shares_one_typography_table_and_honors_style_overrides() {
+        let style = TextViewStyle::default();
+        let base = style.heading_base_font_size();
+
+        let h1 = heading_style(1, &style);
+        assert_eq!(h1.font_weight, FontWeight::BOLD);
+        assert_eq!(h1.font_size, base * 2.);
+        let h6 = heading_style(6, &style);
+        assert_eq!(h6.font_weight, FontWeight::MEDIUM);
+        assert_eq!(h6.font_size, base);
+
+        let overridden = style.with_heading_font_size(|level, base| base * (7. - level as f32));
+        assert_eq!(heading_style(2, &overridden).font_size, base * 5.);
+        assert_eq!(
+            heading_style(2, &overridden).font_weight,
+            FontWeight::SEMIBOLD
+        );
+    }
 
     #[test]
     fn code_block_highlights_are_cached_by_highlighter_identity() {
