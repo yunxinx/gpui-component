@@ -129,20 +129,14 @@ pub struct MarkdownParseContext<'a> {
     source: &'a str,
     prepared_source: &'a str,
     offset: usize,
-    authoritative_image_alts: Option<&'a HashMap<Range<usize>, SharedString>>,
+    authoritative_image_alts: &'a HashMap<Range<usize>, SharedString>,
 }
 
 impl<'a> MarkdownParseContext<'a> {
-    pub(crate) fn new(source: &'a str, prepared_source: &'a str, offset: usize) -> Self {
-        Self {
-            source,
-            prepared_source,
-            offset,
-            authoritative_image_alts: None,
-        }
-    }
-
-    pub(crate) fn with_authoritative_image_alts(
+    /// A context for one parse of `source` through its equal-length
+    /// `prepared_source` view. `authoritative_image_alts` holds the original
+    /// alt text of every image whose bytes a source preparer rewrote.
+    pub(crate) fn new(
         source: &'a str,
         prepared_source: &'a str,
         offset: usize,
@@ -152,7 +146,7 @@ impl<'a> MarkdownParseContext<'a> {
             source,
             prepared_source,
             offset,
-            authoritative_image_alts: Some(authoritative_image_alts),
+            authoritative_image_alts,
         }
     }
 
@@ -193,7 +187,7 @@ impl<'a> MarkdownParseContext<'a> {
 
     pub(crate) fn authoritative_image_alt(&self, node: &mdast::Node) -> Option<&SharedString> {
         let position = node.position()?;
-        self.authoritative_image_alts?
+        self.authoritative_image_alts
             .get(&(position.start.offset..position.end.offset))
     }
 }
@@ -1011,7 +1005,8 @@ mod tests {
         let mdast::Node::Paragraph(paragraph) = &root.children[0] else {
             panic!("expected paragraph");
         };
-        let context = MarkdownParseContext::new(source, source, 0);
+        let alts = HashMap::new();
+        let context = MarkdownParseContext::new(source, source, 0, &alts);
         let node = extensions
             .parse_inline(&paragraph.children[0], &context)
             .expect("legacy inline parser should remain usable");

@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use gpui::SharedString;
 use markdown::mdast::{self, Node};
@@ -320,20 +320,28 @@ fn parse_paragraph(
             );
         }
         Node::Image(raw) => {
+            let alt = parse_cx
+                .authoritative_image_alt(node)
+                .cloned()
+                .unwrap_or_else(|| raw.alt.clone().into());
             paragraph.push_image(ImageNode {
                 url: raw.url.clone().into(),
                 title: raw.title.clone().map(|t| t.into()),
-                alt: Some(raw.alt.clone().into()),
+                alt: Some(alt),
                 ..Default::default()
             });
         }
         Node::ImageReference(raw) => {
             if let Some(reference) = cx.link_refs.get(raw.identifier.as_str()) {
+                let alt = parse_cx
+                    .authoritative_image_alt(node)
+                    .cloned()
+                    .unwrap_or_else(|| raw.alt.clone().into());
                 paragraph.push_reference_image(
                     ImageNode {
                         url: reference.url.clone().into(),
                         title: reference.title.clone(),
-                        alt: Some(raw.alt.clone().into()),
+                        alt: Some(alt),
                         ..Default::default()
                     },
                     raw.identifier.clone().into(),
@@ -422,12 +430,84 @@ fn parse_paragraph(
     text
 }
 
+/// Image alt text as written in the original source, keyed by the image
+/// node's byte range, for every image whose bytes a source preparer rewrote.
+///
+/// Source preparation only produces a parse view; user-visible alt text must
+/// come from the authoritative source. When no image was touched the map is
+/// empty and no second parse happens.
+fn authoritative_image_alts(
+    source: &str,
+    prepared_source: &str,
+    prepared_root: &mdast::Node,
+) -> HashMap<Range<usize>, SharedString> {
+    if source == prepared_source
+        || !prepared_image_source_changed(prepared_root, source, prepared_source)
+    {
+        return HashMap::new();
+    }
+
+    let Ok(root) = markdown::to_mdast(source, &markdown::ParseOptions::gfm()) else {
+        return HashMap::new();
+    };
+    let mut alts = HashMap::new();
+    collect_authoritative_image_alts(&root, &mut alts);
+    alts
+}
+
+fn prepared_image_source_changed(node: &mdast::Node, source: &str, prepared_source: &str) -> bool {
+    if matches!(node, Node::Image(_) | Node::ImageReference(_))
+        && let Some(position) = node.position()
+    {
+        let range = position.start.offset..position.end.offset;
+        if source.get(range.clone()) != prepared_source.get(range) {
+            return true;
+        }
+    }
+    node.children().is_some_and(|children| {
+        children
+            .iter()
+            .any(|child| prepared_image_source_changed(child, source, prepared_source))
+    })
+}
+
+fn collect_authoritative_image_alts(
+    node: &mdast::Node,
+    alts: &mut HashMap<Range<usize>, SharedString>,
+) {
+    let alt = match node {
+        Node::Image(image) => Some(image.alt.as_str()),
+        Node::ImageReference(image) => Some(image.alt.as_str()),
+        _ => None,
+    };
+    if let Some(alt) = alt
+        && let Some(position) = node.position()
+    {
+        alts.insert(
+            position.start.offset..position.end.offset,
+            alt.to_string().into(),
+        );
+    }
+    if let Some(children) = node.children() {
+        for child in children {
+            collect_authoritative_image_alts(child, alts);
+        }
+    }
+}
+
 fn ast_to_document(
     source: &str,
     prepared_source: &str,
     root: mdast::Node,
     cx: &mut NodeContext,
 ) -> ParsedDocument {
+    let authoritative_image_alts = authoritative_image_alts(source, prepared_source, &root);
+    let parse_cx = MarkdownParseContext::new(
+        source,
+        prepared_source,
+        cx.offset,
+        &authoritative_image_alts,
+    );
     let root = match root {
         Node::Root(r) => r,
         _ => panic!("expected root node"),
@@ -436,7 +516,7 @@ fn ast_to_document(
     let blocks = root
         .children
         .into_iter()
-        .map(|c| ast_to_node(source, prepared_source, c, cx))
+        .map(|c| ast_to_node(c, &parse_cx, cx))
         .collect();
     ParsedDocument {
         source: source.to_string().into(),
@@ -454,14 +534,12 @@ fn new_span(pos: Option<markdown::unist::Position>, cx: &NodeContext) -> Option<
 }
 
 fn ast_to_node(
-    source: &str,
-    prepared_source: &str,
     value: mdast::Node,
+    parse_cx: &MarkdownParseContext<'_>,
     cx: &mut NodeContext,
 ) -> BlockNode {
     let span = new_span(value.position().cloned(), cx);
-    let parse_cx = MarkdownParseContext::new(source, prepared_source, cx.offset);
-    if let Some(mut node) = cx.markdown_extensions.parse_block(&value, &parse_cx) {
+    if let Some(mut node) = cx.markdown_extensions.parse_block(&value, parse_cx) {
         node.set_span(span);
         return BlockNode::Custom(node);
     }
@@ -471,7 +549,7 @@ fn ast_to_node(
         Node::Paragraph(val) => {
             let mut paragraph = Paragraph::default();
             val.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c, &parse_cx, cx);
+                parse_paragraph(&mut paragraph, c, parse_cx, cx);
             });
             paragraph.span = new_span(val.position, cx);
             BlockNode::Paragraph(paragraph)
@@ -480,7 +558,7 @@ fn ast_to_node(
             let children = val
                 .children
                 .into_iter()
-                .map(|c| ast_to_node(source, prepared_source, c, cx))
+                .map(|c| ast_to_node(c, parse_cx, cx))
                 .collect();
             BlockNode::Blockquote {
                 children,
@@ -491,7 +569,7 @@ fn ast_to_node(
             let children = list
                 .children
                 .into_iter()
-                .map(|c| ast_to_node(source, prepared_source, c, cx))
+                .map(|c| ast_to_node(c, parse_cx, cx))
                 .collect();
             BlockNode::List {
                 ordered: list.ordered,
@@ -503,7 +581,7 @@ fn ast_to_node(
             let children = val
                 .children
                 .into_iter()
-                .map(|c| ast_to_node(source, prepared_source, c, cx))
+                .map(|c| ast_to_node(c, parse_cx, cx))
                 .collect();
             BlockNode::ListItem {
                 children,
@@ -524,7 +602,7 @@ fn ast_to_node(
         Node::Heading(val) => {
             let mut paragraph = Paragraph::default();
             val.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c, &parse_cx, cx);
+                parse_paragraph(&mut paragraph, c, parse_cx, cx);
             });
 
             BlockNode::Heading {
@@ -569,7 +647,7 @@ fn ast_to_node(
         Node::MdxJsxTextElement(val) => {
             let mut paragraph = Paragraph::default();
             val.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c, &parse_cx, cx);
+                parse_paragraph(&mut paragraph, c, parse_cx, cx);
             });
             paragraph.span = new_span(val.position, cx);
             BlockNode::Paragraph(paragraph)
@@ -577,7 +655,7 @@ fn ast_to_node(
         Node::MdxJsxFlowElement(val) => {
             let mut paragraph = Paragraph::default();
             val.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c, &parse_cx, cx);
+                parse_paragraph(&mut paragraph, c, parse_cx, cx);
             });
             paragraph.span = new_span(val.position, cx);
             BlockNode::Paragraph(paragraph)
@@ -595,7 +673,7 @@ fn ast_to_node(
                 .collect();
             val.children.iter().for_each(|c| {
                 if let Node::TableRow(row) = c {
-                    parse_table_row(&mut table, row, &parse_cx, cx);
+                    parse_table_row(&mut table, row, parse_cx, cx);
                 }
             });
             table.span = new_span(val.position, cx);
@@ -614,7 +692,7 @@ fn ast_to_node(
             )]));
 
             def.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c, &parse_cx, cx);
+                parse_paragraph(&mut paragraph, c, parse_cx, cx);
             });
             paragraph.span = new_span(def.position, cx);
             BlockNode::Paragraph(paragraph)
@@ -1319,6 +1397,74 @@ mod tests {
                 "compatibility changed native parsing for {source:?}"
             );
         }
+    }
+
+    #[test]
+    fn prepared_image_keeps_authoritative_alt_text() {
+        let extensions =
+            MarkdownExtensions::default().prepare_source(|source| source.replace("$5", "^5"));
+        let mut cx = NodeContext {
+            markdown_extensions: extensions.into(),
+            ..NodeContext::default()
+        };
+        let source = "![Cost $5](https://example.com/image.svg \"Preview\")";
+
+        let document = parse(source, &mut cx).unwrap();
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        let image = paragraph.children[0]
+            .image
+            .as_ref()
+            .expect("prepared image");
+        assert_eq!(image.alt.as_deref(), Some("Cost $5"));
+        assert_eq!(image.url.to_string(), "https://example.com/image.svg");
+        assert_eq!(image.title.as_deref(), Some("Preview"));
+        assert_eq!(document.source.as_ref(), source);
+    }
+
+    #[test]
+    fn prepared_reference_images_keep_authoritative_alt_text_and_destinations() {
+        let extensions =
+            MarkdownExtensions::default().prepare_source(|source| source.replace("$$", "^^"));
+        let mut cx = NodeContext {
+            markdown_extensions: extensions.into(),
+            ..NodeContext::default()
+        };
+        // Definitions precede their references here; resolving definitions
+        // that appear later in the document is the retained-definition
+        // pre-pass, restored separately.
+        let source = "[r]: https://a.test/i.svg \"A\"\n[s]: https://b.test/i.svg \"B\"\n[c $$z]: https://c.test/i.svg \"C\"\n[d w$$]: https://d.test/i.svg \"D\"\n\n![a $$x][r] ![b y$$][s] ![c $$z][] ![d w$$]";
+
+        let document = parse(source, &mut cx).unwrap();
+        let BlockNode::Paragraph(paragraph) = document
+            .blocks
+            .iter()
+            .find(|block| matches!(block, BlockNode::Paragraph(_)))
+            .expect("expected paragraph")
+        else {
+            unreachable!();
+        };
+        let images = paragraph
+            .children
+            .iter()
+            .filter_map(|child| child.image.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(images.len(), 4);
+        assert_eq!(images[0].alt.as_deref(), Some("a $$x"));
+        assert_eq!(images[0].url.to_string(), "https://a.test/i.svg");
+        assert_eq!(images[0].title.as_deref(), Some("A"));
+        assert_eq!(images[1].alt.as_deref(), Some("b y$$"));
+        assert_eq!(images[1].url.to_string(), "https://b.test/i.svg");
+        assert_eq!(images[1].title.as_deref(), Some("B"));
+        assert_eq!(images[2].alt.as_deref(), Some("c $$z"));
+        assert_eq!(images[2].url.to_string(), "https://c.test/i.svg");
+        assert_eq!(images[2].title.as_deref(), Some("C"));
+        assert_eq!(images[3].alt.as_deref(), Some("d w$$"));
+        assert_eq!(images[3].url.to_string(), "https://d.test/i.svg");
+        assert_eq!(images[3].title.as_deref(), Some("D"));
+        assert_eq!(document.source.as_ref(), source);
     }
 
     #[test]
