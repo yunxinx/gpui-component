@@ -770,10 +770,7 @@ impl Element for SelectableText {
         let mask_bounds = window.content_mask().bounds;
         let mut line_start = 0;
         let mut line_number = 1;
-        loop {
-            let Some(position) = text_layout.position_for_index(line_start) else {
-                break;
-            };
+        while let Some(position) = text_layout.position_for_index(line_start) {
             if position.y >= mask_bounds.bottom() {
                 break;
             }

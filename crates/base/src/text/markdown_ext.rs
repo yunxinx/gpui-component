@@ -260,7 +260,7 @@ impl MarkdownInlineRenderContext {
 
     /// Resolved native heading typography containing this node, if any.
     pub fn heading_style(&self) -> Option<HeadingStyle> {
-        self.heading_style.clone()
+        self.heading_style
     }
 
     /// Merged Markdown mark inherited by this atomic node.
