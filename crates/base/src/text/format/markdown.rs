@@ -2,6 +2,8 @@ use std::{ops::Range, sync::Arc};
 
 use gpui::SharedString;
 use markdown::mdast::{self, Node};
+use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory as _};
+use unicode_script::{Script, UnicodeScript as _};
 
 use crate::text::{
     document::ParsedDocument,
@@ -16,9 +18,57 @@ use crate::text::{
 pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument, SharedString> {
     let options = cx.markdown_extensions.configured_parse_options();
     let prepared_source = cx.markdown_extensions.prepared_source(source)?;
-    markdown::to_mdast(&prepared_source, &options)
-        .map(|n| ast_to_document(source, &prepared_source, n, cx))
-        .map_err(|e| e.to_string().into())
+    parse_mdast_with_cjk_compatibility(
+        source,
+        prepared_source,
+        &options,
+        cx.markdown_extensions.cjk_emphasis_compatibility_enabled(),
+    )
+    .map(|(prepared_source, root)| ast_to_document(source, &prepared_source, root, cx))
+    .map_err(|e| e.to_string().into())
+}
+
+/// Parse the prepared source, then optionally retry with the narrow CJK
+/// punctuation-adjacent emphasis exception.
+///
+/// The compatibility pass replaces the offending CJK punctuation with private
+/// placeholders of the same byte length, reparses, verifies that exactly the
+/// expected emphasis/strong nodes appeared, and restores the original
+/// characters in the resulting text nodes. Any failure along the way falls back
+/// to the strict CommonMark result.
+fn parse_mdast_with_cjk_compatibility(
+    source: &str,
+    prepared_source: String,
+    options: &markdown::ParseOptions,
+    enabled: bool,
+) -> Result<(String, Node), markdown::message::Message> {
+    let root = markdown::to_mdast(&prepared_source, options)?;
+    if !enabled {
+        return Ok((prepared_source, root));
+    }
+
+    let Some(preparation) = prepare_cjk_attention_source(source, &prepared_source, &root) else {
+        return Ok((prepared_source, root));
+    };
+    let Ok(mut compatible_root) = markdown::to_mdast(&preparation.source, options) else {
+        return Ok((prepared_source, root));
+    };
+    if !cjk_attention_nodes_match(&compatible_root, &preparation.matches) {
+        return Ok((prepared_source, root));
+    }
+    if !restore_cjk_attention_placeholders(
+        &mut compatible_root,
+        source,
+        &preparation.source,
+        preparation.placeholder,
+    ) {
+        return Ok((prepared_source, root));
+    }
+
+    // The compatibility placeholders are an internal parsing aid. Extension
+    // callbacks must continue to observe the caller's prepared source rather
+    // than that private view.
+    Ok((prepared_source, compatible_root))
 }
 
 fn parse_table_row(
@@ -595,6 +645,552 @@ fn ast_to_node(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CjkAttentionKind {
+    Emphasis,
+    Strong,
+}
+
+impl CjkAttentionKind {
+    fn marker_len(self) -> usize {
+        match self {
+            Self::Emphasis => 1,
+            Self::Strong => 2,
+        }
+    }
+}
+
+struct CjkAttentionMatch {
+    range: Range<usize>,
+    kind: CjkAttentionKind,
+    opening_punctuation: Option<Range<usize>>,
+    closing_punctuation: Option<Range<usize>>,
+}
+
+struct CjkAttentionPreparation {
+    source: String,
+    placeholder: char,
+    matches: Vec<(Range<usize>, CjkAttentionKind)>,
+}
+
+const CJK_ATTENTION_PLACEHOLDERS: &[char] = &[
+    '\u{e000}', '\u{e001}', '\u{e002}', '\u{e003}', '\u{e004}', '\u{e005}', '\u{e006}', '\u{e007}',
+];
+
+/// Prepare a private, byte-aligned parse view for the narrow CJK punctuation
+/// exception. Marker eligibility comes from the strict mdast's Text ranges, so
+/// code, math, HTML syntax, images, and link destinations remain opaque. The
+/// marker pair may still span native inline children such as a link label.
+fn prepare_cjk_attention_source(
+    source: &str,
+    prepared_source: &str,
+    root: &Node,
+) -> Option<CjkAttentionPreparation> {
+    let mut attention_matches = Vec::new();
+    collect_cjk_attention_matches(root, source, prepared_source, &mut attention_matches);
+    if attention_matches.is_empty() {
+        return None;
+    }
+
+    let placeholder = CJK_ATTENTION_PLACEHOLDERS
+        .iter()
+        .copied()
+        .find(|placeholder| {
+            !source.contains(*placeholder) && !prepared_source.contains(*placeholder)
+        })?;
+    let mut punctuation_ranges = attention_matches
+        .iter()
+        .flat_map(|attention| {
+            [
+                attention.opening_punctuation.clone(),
+                attention.closing_punctuation.clone(),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .collect::<Vec<_>>();
+    punctuation_ranges.sort_by_key(|range| range.start);
+    punctuation_ranges.dedup();
+    if punctuation_ranges
+        .windows(2)
+        .any(|ranges| ranges[0].end > ranges[1].start)
+        || punctuation_ranges
+            .iter()
+            .any(|range| range.len() != placeholder.len_utf8())
+    {
+        return None;
+    }
+
+    let mut compatible_source = prepared_source.to_string();
+    let placeholder_text = placeholder.to_string();
+    for range in punctuation_ranges {
+        compatible_source.replace_range(range, &placeholder_text);
+    }
+
+    Some(CjkAttentionPreparation {
+        source: compatible_source,
+        placeholder,
+        matches: attention_matches
+            .into_iter()
+            .map(|attention| (attention.range, attention.kind))
+            .collect(),
+    })
+}
+
+fn collect_cjk_attention_matches(
+    node: &Node,
+    source: &str,
+    prepared_source: &str,
+    matches: &mut Vec<CjkAttentionMatch>,
+) {
+    if matches!(
+        node,
+        Node::Paragraph(_) | Node::Heading(_) | Node::TableCell(_) | Node::MdxJsxTextElement(_)
+    ) {
+        let mut text_ranges = Vec::new();
+        collect_text_ranges(node, source, prepared_source, &mut text_ranges);
+        text_ranges.sort_by_key(|range| range.start);
+        let Some(scan_start) = text_ranges.first().map(|range| range.start) else {
+            return;
+        };
+        let scan_end = text_ranges
+            .last()
+            .map(|range| range.end)
+            .unwrap_or(scan_start);
+        let mut cursor = scan_start;
+        while let Some(attention) =
+            find_cjk_attention(source, prepared_source, &text_ranges, cursor, scan_end)
+        {
+            cursor = attention.range.end;
+            matches.push(attention);
+        }
+        return;
+    }
+
+    if let Some(children) = node.children() {
+        for child in children {
+            collect_cjk_attention_matches(child, source, prepared_source, matches);
+        }
+    }
+}
+
+fn collect_text_ranges(
+    node: &Node,
+    source: &str,
+    prepared_source: &str,
+    ranges: &mut Vec<Range<usize>>,
+) {
+    if matches!(node, Node::Text(_))
+        && let Some(position) = node.position()
+    {
+        let range = position.start.offset..position.end.offset;
+        if range.start < range.end
+            && source.get(range.clone()).is_some()
+            && prepared_source.get(range.clone()).is_some()
+        {
+            ranges.push(range);
+        }
+        return;
+    }
+
+    if let Some(children) = node.children() {
+        for child in children {
+            collect_text_ranges(child, source, prepared_source, ranges);
+        }
+    }
+}
+
+/// Find the narrow punctuation-adjacent emphasis form commonly emitted in CJK
+/// prose but rejected by CommonMark's deliberately conservative flanking rule.
+/// At least one side must actually require the CJK exception; ordinary native
+/// Markdown remains the strict parser's responsibility.
+fn find_cjk_attention(
+    source: &str,
+    prepared_source: &str,
+    text_ranges: &[Range<usize>],
+    from: usize,
+    scan_end: usize,
+) -> Option<CjkAttentionMatch> {
+    let mut search = from;
+    while search < scan_end {
+        let relative = prepared_source.get(search..scan_end)?.find('*')?;
+        let open = search + relative;
+        let run_length = attention_run_length(prepared_source, open);
+        let kind = match run_length {
+            1 => CjkAttentionKind::Emphasis,
+            2 => CjkAttentionKind::Strong,
+            _ => {
+                search = open + run_length;
+                continue;
+            }
+        };
+        let marker_len = kind.marker_len();
+        if !attention_marker_is_eligible(source, prepared_source, text_ranges, open, marker_len) {
+            search = open + run_length;
+            continue;
+        }
+
+        let content_start = open + marker_len;
+        let ordinary_open = is_attention_open(
+            prepared_source[..open].chars().next_back(),
+            prepared_source.get(content_start..)?.chars().next(),
+        );
+        let cjk_open = is_cjk_attention_open(
+            source[..open].chars().next_back(),
+            source.get(content_start..)?.chars().next(),
+        );
+        let opening_punctuation = if ordinary_open {
+            None
+        } else if cjk_open {
+            let range = next_character_range(source, content_start)?;
+            compatible_punctuation_range(source, prepared_source, text_ranges, range)
+        } else {
+            search = open + run_length;
+            continue;
+        };
+        if !ordinary_open && opening_punctuation.is_none() {
+            search = open + run_length;
+            continue;
+        }
+
+        if let Some((close, closing_punctuation)) = find_cjk_attention_close(
+            source,
+            prepared_source,
+            text_ranges,
+            content_start,
+            scan_end,
+            kind,
+        ) && (opening_punctuation.is_some() || closing_punctuation.is_some())
+        {
+            return Some(CjkAttentionMatch {
+                range: open..close + marker_len,
+                kind,
+                opening_punctuation,
+                closing_punctuation,
+            });
+        }
+
+        search = open + run_length;
+    }
+    None
+}
+
+fn find_cjk_attention_close(
+    source: &str,
+    prepared_source: &str,
+    text_ranges: &[Range<usize>],
+    content_start: usize,
+    scan_end: usize,
+    kind: CjkAttentionKind,
+) -> Option<(usize, Option<Range<usize>>)> {
+    let marker_len = kind.marker_len();
+    let mut search = content_start;
+    while search < scan_end {
+        let relative = prepared_source.get(search..scan_end)?.find('*')?;
+        let close = search + relative;
+        let run_length = attention_run_length(prepared_source, close);
+        if run_length != marker_len
+            || !attention_marker_is_eligible(
+                source,
+                prepared_source,
+                text_ranges,
+                close,
+                marker_len,
+            )
+        {
+            search = close + run_length;
+            continue;
+        }
+
+        let ordinary_close = is_attention_close(
+            prepared_source[..close].chars().next_back(),
+            prepared_source.get(close + marker_len..)?.chars().next(),
+        );
+        if ordinary_close {
+            return Some((close, None));
+        }
+
+        let cjk_close = is_cjk_attention_close(
+            source[..close].chars().next_back(),
+            source.get(close + marker_len..)?.chars().next(),
+        );
+        if cjk_close
+            && let Some(range) = previous_character_range(source, close)
+            && let Some(range) =
+                compatible_punctuation_range(source, prepared_source, text_ranges, range)
+        {
+            return Some((close, Some(range)));
+        }
+
+        search = close + run_length;
+    }
+    None
+}
+
+fn attention_marker_is_eligible(
+    source: &str,
+    prepared_source: &str,
+    text_ranges: &[Range<usize>],
+    marker_start: usize,
+    marker_len: usize,
+) -> bool {
+    let marker_range = marker_start..marker_start + marker_len;
+    range_is_text(marker_range.clone(), text_ranges)
+        && attention_run_length(source, marker_start) == marker_len
+        && source.get(marker_range.clone()) == prepared_source.get(marker_range)
+        && !marker_is_escaped(source, marker_start)
+        && !marker_is_escaped(prepared_source, marker_start)
+        && (marker_start == 0 || source.as_bytes()[marker_start - 1] != b'*')
+        && (marker_start == 0 || prepared_source.as_bytes()[marker_start - 1] != b'*')
+}
+
+fn compatible_punctuation_range(
+    source: &str,
+    prepared_source: &str,
+    text_ranges: &[Range<usize>],
+    range: Range<usize>,
+) -> Option<Range<usize>> {
+    (range.len() == 3
+        && range_is_text(range.clone(), text_ranges)
+        && source.get(range.clone()) == prepared_source.get(range.clone()))
+    .then_some(range)
+}
+
+fn range_is_text(range: Range<usize>, text_ranges: &[Range<usize>]) -> bool {
+    text_ranges
+        .iter()
+        .any(|text_range| text_range.start <= range.start && text_range.end >= range.end)
+}
+
+fn marker_is_escaped(text: &str, marker_start: usize) -> bool {
+    text.as_bytes()[..marker_start]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn next_character_range(text: &str, start: usize) -> Option<Range<usize>> {
+    let character = text.get(start..)?.chars().next()?;
+    Some(start..start + character.len_utf8())
+}
+
+fn previous_character_range(text: &str, end: usize) -> Option<Range<usize>> {
+    let (start, _) = text.get(..end)?.char_indices().next_back()?;
+    Some(start..end)
+}
+
+fn cjk_attention_nodes_match(root: &Node, expected: &[(Range<usize>, CjkAttentionKind)]) -> bool {
+    expected
+        .iter()
+        .all(|(range, kind)| cjk_attention_node_matches(root, range, *kind))
+}
+
+fn cjk_attention_node_matches(
+    node: &Node,
+    expected_range: &Range<usize>,
+    expected_kind: CjkAttentionKind,
+) -> bool {
+    let kind_matches = matches!(
+        (node, expected_kind),
+        (Node::Emphasis(_), CjkAttentionKind::Emphasis)
+            | (Node::Strong(_), CjkAttentionKind::Strong)
+    );
+    if kind_matches
+        && node.position().is_some_and(|position| {
+            position.start.offset == expected_range.start
+                && position.end.offset == expected_range.end
+        })
+    {
+        return true;
+    }
+
+    node.children().is_some_and(|children| {
+        children
+            .iter()
+            .any(|child| cjk_attention_node_matches(child, expected_range, expected_kind))
+    })
+}
+
+fn restore_cjk_attention_placeholders(
+    root: &mut Node,
+    source: &str,
+    compatible_source: &str,
+    placeholder: char,
+) -> bool {
+    let placeholder_text = placeholder.to_string();
+    let replacements = compatible_source
+        .match_indices(placeholder)
+        .filter_map(|(offset, _)| {
+            source
+                .get(offset..)
+                .and_then(|source| source.chars().next())
+                .map(|character| (offset, character))
+        })
+        .collect::<Vec<_>>();
+    if replacements.is_empty()
+        || replacements.iter().any(|(offset, character)| {
+            character.len_utf8() != placeholder.len_utf8()
+                || compatible_source.get(*offset..*offset + placeholder.len_utf8())
+                    != Some(placeholder_text.as_str())
+        })
+    {
+        return false;
+    }
+
+    let mut restored = 0;
+    restore_cjk_attention_node(root, &replacements, placeholder, &mut restored)
+        && restored == replacements.len()
+}
+
+fn restore_cjk_attention_node(
+    node: &mut Node,
+    replacements: &[(usize, char)],
+    placeholder: char,
+    restored: &mut usize,
+) -> bool {
+    if let Node::Text(text) = node {
+        let Some(position) = text.position.as_ref() else {
+            return false;
+        };
+        let replacement_characters = replacements
+            .iter()
+            .filter(|(offset, _)| *offset >= position.start.offset && *offset < position.end.offset)
+            .map(|(_, character)| *character)
+            .collect::<Vec<_>>();
+        if text
+            .value
+            .chars()
+            .filter(|character| *character == placeholder)
+            .count()
+            != replacement_characters.len()
+        {
+            return false;
+        }
+        if !replacement_characters.is_empty() {
+            let replacement_count = replacement_characters.len();
+            let mut characters = replacement_characters.into_iter();
+            text.value = text
+                .value
+                .chars()
+                .map(|character| {
+                    if character == placeholder {
+                        characters.next().expect("placeholder count was validated")
+                    } else {
+                        character
+                    }
+                })
+                .collect();
+            *restored += replacement_count;
+        }
+        return true;
+    }
+
+    if let Some(children) = node.children_mut() {
+        for child in children {
+            if !restore_cjk_attention_node(child, replacements, placeholder, restored) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn attention_run_length(text: &str, marker_start: usize) -> usize {
+    text.as_bytes()[marker_start..]
+        .iter()
+        .take_while(|byte| **byte == b'*')
+        .count()
+}
+
+fn is_attention_open(previous: Option<char>, next: Option<char>) -> bool {
+    next.is_some_and(|character| !character.is_whitespace())
+        && (!next.is_some_and(is_markdown_punctuation)
+            || previous.is_none_or(|character| {
+                character.is_whitespace() || is_markdown_punctuation(character)
+            }))
+}
+
+fn is_attention_close(previous: Option<char>, next: Option<char>) -> bool {
+    previous.is_some_and(|character| !character.is_whitespace())
+        && (!previous.is_some_and(is_markdown_punctuation)
+            || next.is_none_or(|character| {
+                character.is_whitespace() || is_markdown_punctuation(character)
+            }))
+}
+
+fn is_cjk_attention_open(previous: Option<char>, next: Option<char>) -> bool {
+    previous.is_some_and(|character| character.script() == Script::Han)
+        && next.is_some_and(is_cjk_opening_punctuation)
+}
+
+fn is_cjk_attention_close(previous: Option<char>, next: Option<char>) -> bool {
+    previous.is_some_and(is_cjk_closing_punctuation)
+        && next.is_some_and(is_unicode_letter_or_number)
+}
+
+fn is_markdown_punctuation(character: char) -> bool {
+    character.is_ascii_punctuation()
+        || character.general_category_group() == GeneralCategoryGroup::Punctuation
+}
+
+fn is_unicode_letter_or_number(character: char) -> bool {
+    matches!(
+        character.general_category_group(),
+        GeneralCategoryGroup::Letter | GeneralCategoryGroup::Number
+    )
+}
+
+fn is_cjk_opening_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '《' | '「'
+            | '『'
+            | '【'
+            | '〔'
+            | '〖'
+            | '〘'
+            | '〚'
+            | '〈'
+            | '（'
+            | '［'
+            | '｛'
+            | '“'
+            | '‘'
+            | '﹁'
+            | '﹃'
+            | '﹙'
+            | '﹛'
+            | '﹝'
+    )
+}
+
+fn is_cjk_closing_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '》' | '」'
+            | '』'
+            | '】'
+            | '〕'
+            | '〗'
+            | '〙'
+            | '〛'
+            | '〉'
+            | '）'
+            | '］'
+            | '｝'
+            | '”'
+            | '’'
+            | '﹂'
+            | '﹄'
+            | '﹚'
+            | '﹜'
+            | '﹞'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +1220,105 @@ mod tests {
                 .any(|(_, mark)| mark.bold && mark.italic),
             "nested emphasis should produce a bold and italic mark"
         );
+    }
+
+    #[test]
+    fn cjk_emphasis_compatibility_is_narrow_and_opt_in() {
+        fn parse_with_compatibility(source: &str) -> ParsedDocument {
+            let mut cx = NodeContext {
+                markdown_extensions: MarkdownExtensions::default()
+                    .cjk_emphasis_compatibility()
+                    .into(),
+                ..NodeContext::default()
+            };
+            parse(source, &mut cx).unwrap()
+        }
+
+        fn paragraph(document: &ParsedDocument) -> &Paragraph {
+            let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
+                panic!("expected paragraph");
+            };
+            paragraph
+        }
+
+        fn has_mark(paragraph: &Paragraph, predicate: impl Fn(&TextMark) -> bool) -> bool {
+            paragraph
+                .children
+                .iter()
+                .flat_map(|child| child.marks.iter().map(|(_, mark)| mark))
+                .any(predicate)
+        }
+
+        let strong_source = "一次**“超现实主义”的渲染挑战**后";
+        let mut strict_cx = NodeContext::default();
+        let strict = parse(strong_source, &mut strict_cx).unwrap();
+        assert_eq!(strict.source.as_ref(), strong_source);
+        assert_eq!(paragraph(&strict).text(), strong_source);
+        assert!(!has_mark(paragraph(&strict), |mark| mark.bold));
+
+        let strong = parse_with_compatibility(strong_source);
+        assert_eq!(strong.source.as_ref(), strong_source);
+        assert_eq!(paragraph(&strong).text(), "一次“超现实主义”的渲染挑战后");
+        assert!(has_mark(paragraph(&strong), |mark| mark.bold));
+
+        let emphasis = parse_with_compatibility("了*《法》*后");
+        assert_eq!(paragraph(&emphasis).text(), "了《法》后");
+        assert!(has_mark(paragraph(&emphasis), |mark| mark.italic));
+
+        let linked = parse_with_compatibility("一次**“点击[链接](https://example.com)”**后");
+        let linked_paragraph = paragraph(&linked);
+        assert_eq!(linked_paragraph.text(), "一次“点击链接”后");
+        let linked_text = linked_paragraph
+            .children
+            .iter()
+            .find(|child| child.text.contains("链接"))
+            .expect("expected linked strong text");
+        let link_start = linked_text.text.find("链接").expect("linked text offset");
+        let link_range = link_start..link_start + "链接".len();
+        assert!(linked_text.marks.iter().any(|(range, mark)| {
+            mark.bold && range.start <= link_range.start && range.end >= link_range.end
+        }));
+        assert!(linked_text.marks.iter().any(|(range, mark)| {
+            range.start <= link_range.start
+                && range.end >= link_range.end
+                && mark
+                    .link
+                    .as_ref()
+                    .is_some_and(|link| link.url.as_ref() == "https://example.com")
+        }));
+
+        let decoded = parse_with_compatibility("一次**“内容 &amp; 内容”**后");
+        assert_eq!(paragraph(&decoded).text(), "一次“内容 & 内容”后");
+        assert!(has_mark(paragraph(&decoded), |mark| mark.bold));
+
+        let list = parse_with_compatibility("- **H01M（电池）**1,560件");
+        let BlockNode::List { children, .. } = &list.blocks[0] else {
+            panic!("expected list");
+        };
+        let BlockNode::ListItem { children, .. } = &children[0] else {
+            panic!("expected list item");
+        };
+        let BlockNode::Paragraph(list_paragraph) = &children[0] else {
+            panic!("expected list paragraph");
+        };
+        assert_eq!(list_paragraph.text(), "H01M（电池）1,560件");
+        assert!(has_mark(list_paragraph, |mark| mark.bold));
+
+        for source in [
+            "foo**a,b**bar",
+            "a**+x）**1",
+            "3 * 4 * 5",
+            r"\*\*",
+            "`一次**“内容”**后`",
+        ] {
+            let mut strict_cx = NodeContext::default();
+            let strict = parse(source, &mut strict_cx).unwrap();
+            let compatible = parse_with_compatibility(source);
+            assert_eq!(
+                compatible, strict,
+                "compatibility changed native parsing for {source:?}"
+            );
+        }
     }
 
     #[test]

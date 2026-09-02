@@ -41,6 +41,8 @@ serde_json.workspace = true
 smallvec.workspace = true
 sum-tree.workspace = true
 tracing.workspace = true
+unicode-properties = { version = "0.1.4", features = ["general-category"] }
+unicode-script = "0.5.8"
 unicode-segmentation = "1.12.0"
 web-time = "1"
 syntect.workspace = true

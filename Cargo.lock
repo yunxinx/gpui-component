@@ -3486,6 +3486,8 @@ dependencies = [
  "smol",
  "syntect",
  "tracing",
+ "unicode-properties",
+ "unicode-script",
  "unicode-segmentation",
  "web-time",
  "zed-sum-tree",
