@@ -39,16 +39,12 @@ fn with_tokens<R>(read: impl FnOnce(&SemanticThemeTokens) -> R) -> Option<R> {
     CACHED.with(|cached| cached.borrow().as_ref().map(read))
 }
 
+pub(crate) fn current() -> Option<SemanticThemeTokens> {
+    with_tokens(Clone::clone)
+}
+
 pub(crate) fn token_color(name: &str) -> Option<Hsla> {
     with_tokens(|tokens| resolve_color(&tokens.colors, name)).flatten()
-}
-
-pub(crate) fn token_spacing(name: &str) -> Option<Pixels> {
-    with_tokens(|tokens| resolve_spacing(&tokens.spacing, name)).flatten()
-}
-
-pub(crate) fn token_radius(name: &str) -> Option<Pixels> {
-    with_tokens(|tokens| resolve_radius(&tokens.radius, name)).flatten()
 }
 
 pub(crate) const COLOR_TOKEN_NAMES: &[&str] = &[
@@ -69,6 +65,7 @@ pub(crate) const COLOR_TOKEN_NAMES: &[&str] = &[
     "border",
     "input",
     "ring",
+    "selection",
 ];
 
 pub(crate) const SPACING_TOKEN_NAMES: &[&str] = &["xxs", "xs", "sm", "md", "lg", "xl", "xxl"];
@@ -84,7 +81,7 @@ pub(crate) fn radius_token_names() -> &'static [&'static str] {
     RADIUS_TOKEN_NAMES
 }
 
-fn resolve_color(colors: &ColorTokens, name: &str) -> Option<Hsla> {
+pub(crate) fn resolve_color(colors: &ColorTokens, name: &str) -> Option<Hsla> {
     Some(match name {
         "background" => colors.background,
         "foreground" => colors.foreground,
@@ -103,11 +100,12 @@ fn resolve_color(colors: &ColorTokens, name: &str) -> Option<Hsla> {
         "border" => colors.border,
         "input" => colors.input,
         "ring" => colors.ring,
+        "selection" => colors.selection,
         _ => return None,
     })
 }
 
-fn resolve_spacing(spacing: &SpacingTokens, name: &str) -> Option<Pixels> {
+pub(crate) fn resolve_spacing(spacing: &SpacingTokens, name: &str) -> Option<Pixels> {
     Some(match name {
         "xxs" => spacing.xxs,
         "xs" => spacing.xs,
@@ -120,7 +118,7 @@ fn resolve_spacing(spacing: &SpacingTokens, name: &str) -> Option<Pixels> {
     })
 }
 
-fn resolve_radius(radius: &RadiusTokens, name: &str) -> Option<Pixels> {
+pub(crate) fn resolve_radius(radius: &RadiusTokens, name: &str) -> Option<Pixels> {
     Some(match name {
         "none" => radius.none,
         "sm" => radius.sm,

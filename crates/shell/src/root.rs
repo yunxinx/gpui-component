@@ -18,8 +18,8 @@ use gpui::{
     Anchor, AnyElement, AnyView, App, AppContext as _, ClickEvent, ClipboardItem, Context,
     ElementId, Entity, FocusHandle, Global, Hsla, InteractiveElement as _, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, WeakFocusHandle, Window, actions, deferred, div,
-    hsla, prelude::FluentBuilder as _, px,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, WeakFocusHandle, Window,
+    actions, deferred, div, hsla, prelude::FluentBuilder as _, px,
 };
 use gpui_base::{
     ColorTokens, Dialog, POPUP_PRIORITY, Placement, RadiusTokens, Sheet, SpacingTokens,
@@ -736,6 +736,20 @@ impl Render for ShellRoot {
 
         div()
             .id("shell-root")
+            // The window's base text size, from the theme rather than from
+            // GPUI's default rem.
+            //
+            // Everything this root draws itself -- toasts, the sheet, the
+            // dialog scrim's chrome -- states no size of its own and inherits
+            // this one. Without it that chrome sat at GPUI's 16px default
+            // while the components an application builds set their own sizes,
+            // so a dense application drawn at 12px got 16px notifications over
+            // it. `md` is the base by the library's own convention: it is what
+            // `gpui_component::Theme` already takes its `font_size` from.
+            //
+            // The default `md` is that same 16px, so a theme that says nothing
+            // about type is drawn exactly as it was before this existed.
+            .text_size(tokens.typography.md.size)
             .key_context(CONTEXT)
             .on_action(cx.listener(Self::on_action_tab))
             .on_action(cx.listener(Self::on_action_tab_prev))
@@ -757,7 +771,11 @@ impl Render for ShellRoot {
             .text_color(colors.foreground)
             // Painted back to front; see the stacking order on `ShellRoot`.
             .child(TextSelectionLayer)
-            .child(self.content.clone())
+            .child(
+                self.content
+                    .clone()
+                    .cached(StyleRefinement::default().size_full()),
+            )
             .children(self.sheet_layer(&colors, &spacing, cx))
             .children(self.dialog_layer(&colors, &radius, &spacing, cx))
             .child(self.toast_layer(&colors, &radius, &spacing, cx))
