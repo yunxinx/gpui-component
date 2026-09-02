@@ -423,6 +423,7 @@ struct LineFragmentLayout {
     kind: LineFragmentKind,
     size: Size<Pixels>,
     source_range: Range<usize>,
+    alignment: FragmentAlignment,
 }
 
 enum LineFragmentKind {
@@ -964,6 +965,11 @@ fn layout_flow(
 
     let line_ranges = line_ranges(items, image_sizes, text_style, wrap_width, window);
     let font_size = text_style.font_size.to_pixels(rem_size);
+    // Every line starts from the inherited font's baseline so a line made only
+    // of atomic items still sits where its surrounding prose would.
+    let default_run = text_style.to_run(1);
+    let default_shape = shape_line(" ".into(), font_size, &[default_run], window);
+    let default_alignment = text_baseline_alignment(&default_shape, line_height);
     let mut fragments = Vec::new();
     let mut max_width = Pixels::ZERO;
     let mut y = Pixels::ZERO;
@@ -971,7 +977,14 @@ fn layout_flow(
     for line_range in line_ranges {
         let mut line_fragments = Vec::new();
         let mut line_width = Pixels::ZERO;
-        let mut actual_line_height = line_height;
+        let FragmentAlignment::Baseline {
+            ascent: mut line_ascent,
+            descent: mut line_descent,
+        } = default_alignment
+        else {
+            unreachable!("text alignment is always baseline-relative");
+        };
+        let mut max_center_height = Pixels::ZERO;
         let mut item_start = 0;
 
         for (item_ix, item) in items.iter().enumerate() {
@@ -1004,6 +1017,12 @@ fn layout_flow(
                         let runs = runs_for_highlights(&subtext, text_style, highlights.clone());
                         let shaped_line = shape_line(subtext.clone(), font_size, &runs, window);
                         let width = shaped_line.width();
+                        let alignment = text_baseline_alignment(&shaped_line, line_height);
+                        let FragmentAlignment::Baseline { ascent, descent } = alignment else {
+                            unreachable!("text alignment is always baseline-relative");
+                        };
+                        line_ascent = line_ascent.max(ascent);
+                        line_descent = line_descent.max(descent);
                         line_width += width;
                         line_fragments.push(LineFragmentLayout {
                             item_ix,
@@ -1012,35 +1031,48 @@ fn layout_flow(
                                 links,
                                 highlights,
                             },
-                            size: size(width, line_height),
+                            size: size(width, ascent + descent),
                             source_range: local_start..local_end,
+                            alignment,
                         });
                     }
                 }
                 MeasureItem::Image { .. } => {
                     if line_range.start <= item_start && item_end <= line_range.end {
-                        let size = image_sizes[item_ix]
-                            .expect("image size should be measured before layout");
+                        // Images keep their intrinsic size and stay centered on
+                        // the line rather than joining the text baseline.
+                        let size = image_sizes
+                            .get(item_ix)
+                            .copied()
+                            .flatten()
+                            .unwrap_or_else(|| inline_image_size_for_line(None, line_height));
                         line_width += size.width;
-                        actual_line_height = actual_line_height.max(size.height);
+                        max_center_height = max_center_height.max(size.height);
                         line_fragments.push(LineFragmentLayout {
                             item_ix,
                             kind: LineFragmentKind::Image,
                             size,
                             source_range: 0..IMAGE_LEN,
+                            alignment: FragmentAlignment::Center,
                         });
                     }
                 }
                 MeasureItem::Custom { text, metrics } => {
                     if line_range.start <= item_start && item_end <= line_range.end {
-                        let custom_size = metrics.size();
-                        line_width += custom_size.width;
-                        actual_line_height = actual_line_height.max(custom_size.height);
+                        // Atomic items (formulas) share the text baseline via
+                        // the ascent/descent their renderer reported.
+                        line_width += metrics.width();
+                        line_ascent = line_ascent.max(metrics.ascent());
+                        line_descent = line_descent.max(metrics.descent());
                         line_fragments.push(LineFragmentLayout {
                             item_ix,
                             kind: LineFragmentKind::Custom { text: text.clone() },
-                            size: custom_size,
+                            size: metrics.size(),
                             source_range: 0..text.len(),
+                            alignment: FragmentAlignment::Baseline {
+                                ascent: metrics.ascent(),
+                                descent: metrics.descent(),
+                            },
                         });
                     }
                 }
@@ -1049,9 +1081,16 @@ fn layout_flow(
             item_start = item_end;
         }
 
+        let baseline_height = line_ascent + line_descent;
+        let actual_line_height = baseline_height.max(max_center_height);
+        let baseline_y = y + (actual_line_height - baseline_height) / 2. + line_ascent;
         let mut x = Pixels::ZERO;
         for fragment in line_fragments {
-            let origin = point(x, y + (actual_line_height - fragment.size.height) / 2.);
+            let fragment_y = match fragment.alignment {
+                FragmentAlignment::Baseline { ascent, .. } => baseline_y - ascent,
+                FragmentAlignment::Center => y + (actual_line_height - fragment.size.height) / 2.,
+            };
+            let origin = point(x, fragment_y);
             let positioned = match fragment.kind {
                 LineFragmentKind::Text {
                     text,
@@ -1317,6 +1356,22 @@ fn shape_line(
     window.text_system().shape_line(text, font_size, runs, None)
 }
 
+/// Where a shaped text fragment's baseline sits inside its line box.
+///
+/// The glyph box is centered in `line_height` (GPUI's usual text placement),
+/// so the fragment's ascent includes the leading above the glyphs and its
+/// descent the leading below; together they always span the full line box.
+fn text_baseline_alignment(shaped_line: &ShapedLine, line_height: Pixels) -> FragmentAlignment {
+    let glyph_height = shaped_line.ascent + shaped_line.descent;
+    let height = line_height.max(glyph_height);
+    let top_padding = (height - glyph_height) / 2.;
+    let ascent = top_padding + shaped_line.ascent;
+    FragmentAlignment::Baseline {
+        ascent,
+        descent: height - ascent,
+    }
+}
+
 fn slice_ranges<T, U>(
     ranges: &[(Range<usize>, T)],
     start: usize,
@@ -1337,6 +1392,7 @@ fn slice_ranges<T, U>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{Context, Render, TestAppContext, VisualTestContext};
 
     #[test]
     fn inline_image_without_explicit_size_scales_intrinsic_ratio_to_line_height() {
@@ -1353,5 +1409,108 @@ mod tests {
         let measured = inline_image_size_for_line(None, px(20.));
 
         assert_eq!(measured, size(px(15.), px(15.)));
+    }
+
+    struct EmptyRoot;
+
+    impl Render for EmptyRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui::Empty
+        }
+    }
+
+    fn text_item(text: &str) -> MeasureItem {
+        MeasureItem::Text {
+            text: text.into(),
+            links: Vec::new(),
+            highlights: Vec::new(),
+        }
+    }
+
+    #[gpui::test]
+    fn shaped_mixed_flow_shares_the_text_baseline_and_centers_images(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (_, cx) = cx.add_window_view(|_, _| EmptyRoot);
+        let cx: &mut VisualTestContext = cx;
+
+        cx.update(|window, _| {
+            let text_style = window.text_style();
+            let line_height = window.line_height();
+
+            // A tall formula raises the line; the text keeps its baseline
+            // aligned with the formula's reported baseline.
+            let metrics = InlineMetrics::new(px(31.), line_height + px(6.), px(9.));
+            let items = vec![
+                text_item("before "),
+                MeasureItem::Custom {
+                    text: "$x^2$".into(),
+                    metrics,
+                },
+                text_item(" after"),
+            ];
+            let image_sizes = vec![None; items.len()];
+            let layout = layout_flow(&items, &image_sizes, &text_style, None, window);
+
+            let mut text_baselines = Vec::new();
+            let mut custom_baseline = None;
+            for fragment in &layout.fragments {
+                match fragment {
+                    PositionedFragment::Text { origin, size, .. } => {
+                        let default_run = text_style.to_run(1);
+                        let shaped = shape_line(
+                            " ".into(),
+                            text_style.font_size.to_pixels(window.rem_size()),
+                            &[default_run],
+                            window,
+                        );
+                        let FragmentAlignment::Baseline { ascent, .. } =
+                            text_baseline_alignment(&shaped, line_height)
+                        else {
+                            unreachable!()
+                        };
+                        assert_eq!(size.height, line_height);
+                        text_baselines.push(origin.y + ascent);
+                    }
+                    PositionedFragment::Custom { origin, .. } => {
+                        custom_baseline = Some(origin.y + metrics.ascent());
+                    }
+                    PositionedFragment::Image { .. } => unreachable!(),
+                }
+            }
+            let custom_baseline = custom_baseline.expect("custom fragment");
+            assert_eq!(text_baselines.len(), 2);
+            for baseline in text_baselines {
+                assert!(
+                    (baseline - custom_baseline).abs() < px(0.01),
+                    "text baseline {baseline:?} must match the formula baseline {custom_baseline:?}"
+                );
+            }
+            assert_eq!(layout.size.height, metrics.ascent() + metrics.descent());
+
+            // Images keep the historical centered placement.
+            let image_items = vec![
+                text_item("before"),
+                MeasureItem::Image {
+                    url: "https://example.com/image.svg".into(),
+                    width: None,
+                    height: None,
+                },
+                text_item("after"),
+            ];
+            let image_sizes = vec![None, Some(size(px(8.), px(8.))), None];
+            let layout = layout_flow(&image_items, &image_sizes, &text_style, None, window);
+            let image = layout
+                .fragments
+                .iter()
+                .find_map(|fragment| match fragment {
+                    PositionedFragment::Image { origin, size, .. } => Some((*origin, *size)),
+                    PositionedFragment::Text { .. } | PositionedFragment::Custom { .. } => None,
+                })
+                .expect("inline image fragment");
+            assert!(
+                (image.0.y + image.1.height / 2. - layout.size.height / 2.).abs() < px(0.01),
+                "inline images must retain the original centered line alignment"
+            );
+        });
     }
 }
