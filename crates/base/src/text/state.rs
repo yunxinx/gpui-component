@@ -370,6 +370,19 @@ impl TextViewState {
         }
     }
 
+    /// The parse diagnostic as it should be shown to the user, if parsing
+    /// failed.
+    ///
+    /// The parser (which may run on a background task) keeps the raw,
+    /// locale-independent diagnostic; the extensions' `parse_error_formatter`
+    /// resolves the presentation at render time so it can consult the current
+    /// locale. Without a formatter the raw diagnostic is shown.
+    pub fn display_error(&self) -> Option<SharedString> {
+        self.parsed_error
+            .as_ref()
+            .map(|error| self.markdown_extensions.format_parse_error(error))
+    }
+
     /// Return the selected text, in the view's [`SelectionFormat`].
     pub fn selected_text(&self) -> String {
         self.selected_text_in(None)
@@ -689,13 +702,14 @@ impl Render for TextViewState {
         node_cx.link_click_handler = self.link_click_handler.clone();
         node_cx.markdown_extensions = self.markdown_extensions.clone();
         node_cx.style = self.text_view_style.clone();
+        let parsed_error = self.display_error();
 
         v_flex()
             .w_full()
             // Clamped content must keep its natural height: stretching it to
             // the capped box would hide the overflow the clamp has to measure.
             .when(self.max_lines.is_none(), |this| this.h_full())
-            .map(|this| match &mut self.parsed_error {
+            .map(|this| match parsed_error {
                 None => this.child(document.render_root(
                     if self.scrollable {
                         Some(self.list_state.clone())
@@ -1350,5 +1364,47 @@ mod tests {
             .parse_error_formatter(|error| error.to_string());
         assert_ne!(renderers_a.revision(), renderers_b.revision());
         assert!(renderers_a.has_same_parser_configuration(&renderers_b));
+    }
+
+    #[gpui::test]
+    fn parse_errors_are_formatted_for_display_but_stored_raw(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let extensions = Arc::new(
+            MarkdownExtensions::default()
+                .try_prepare_source(|_| Err::<String, _>("preparation-code"))
+                .parse_error_formatter(|error| format!("localized: {error}")),
+        );
+        let state = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut state = TextViewState::markdown("body", cx);
+                state.set_markdown_extensions(extensions.clone(), cx);
+                state
+            })
+        });
+        cx.run_until_parked();
+
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.parsed_error.as_deref(), Some("preparation-code"));
+            assert_eq!(
+                state.display_error().as_deref(),
+                Some("localized: preparation-code")
+            );
+        });
+
+        // Without a formatter the raw diagnostic is what the user sees.
+        let unformatted = Arc::new(
+            MarkdownExtensions::default().try_prepare_source(|_| Err::<String, _>("raw-code")),
+        );
+        let state = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut state = TextViewState::markdown("body", cx);
+                state.set_markdown_extensions(unformatted, cx);
+                state
+            })
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.display_error().as_deref(), Some("raw-code"));
+        });
     }
 }
