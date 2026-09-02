@@ -1268,4 +1268,87 @@ mod tests {
             assert_eq!(node.data::<String>().map(String::as_str), Some("TSLA.US"));
         });
     }
+
+    fn first_paragraph_has_custom_inline(state: &TextViewState) -> bool {
+        let node::BlockNode::Paragraph(paragraph) = &state.parsed_content.document.blocks[0] else {
+            panic!("expected a paragraph");
+        };
+        paragraph
+            .children
+            .iter()
+            .any(|child| child.custom.is_some())
+    }
+
+    #[gpui::test]
+    fn set_markdown_extensions_reparses_when_only_the_inline_parser_shape_changes(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("see $TSLA$", cx)));
+        cx.run_until_parked();
+
+        // A block renderer that is never used keeps the block-parser shape
+        // identical between both extension sets; only the inline parser
+        // differs, which must still count as a parser change.
+        let without_inline = MarkdownExtensions::default()
+            .block_renderer("unused", |_, _, _| gpui::Empty.into_any_element());
+        state.update(cx, |state, cx| {
+            state.set_markdown_extensions(Arc::new(without_inline), cx);
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert!(!first_paragraph_has_custom_inline(state))
+        });
+
+        let with_inline = MarkdownExtensions::default()
+            .block_renderer("unused", |_, _, _| gpui::Empty.into_any_element())
+            .inline_parser(|node, cx| {
+                let markdown::mdast::Node::Text(text) = node else {
+                    return None;
+                };
+                let symbol = text.value.trim().strip_prefix("see $")?.strip_suffix('$')?;
+                Some(
+                    MarkdownNode::new("ticker", symbol.to_string())
+                        .text(text.value.clone())
+                        .markdown(cx.node_source(node).unwrap_or_default()),
+                )
+            });
+        state.update(cx, |state, cx| {
+            state.set_markdown_extensions(Arc::new(with_inline), cx);
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert!(
+                first_paragraph_has_custom_inline(state),
+                "adding an inline parser must reparse the existing document"
+            );
+        });
+    }
+
+    #[test]
+    fn parser_configuration_tracks_every_parse_affecting_field() {
+        let strict = MarkdownExtensions::default();
+        for changed in [
+            MarkdownExtensions::default().cjk_emphasis_compatibility(),
+            MarkdownExtensions::default().parse_options(|_| {}),
+            MarkdownExtensions::default().prepare_source(|source| source.to_string()),
+            MarkdownExtensions::default().inline_parser(|_, _| None),
+            MarkdownExtensions::default().inline_renderer("x", |_, _, _, _| None),
+        ] {
+            assert!(
+                !strict.has_same_parser_configuration(&changed),
+                "a parse-affecting field changed but the shape compared equal"
+            );
+        }
+
+        // Rebuilding equivalent closures keeps the shape; so does a formatter,
+        // which only runs while rendering.
+        let renderers_a = MarkdownExtensions::default()
+            .block_renderer("ticker", |_, _, _| gpui::Empty.into_any_element());
+        let renderers_b = MarkdownExtensions::default()
+            .block_renderer("ticker", |_, _, _| gpui::Empty.into_any_element())
+            .parse_error_formatter(|error| error.to_string());
+        assert_ne!(renderers_a.revision(), renderers_b.revision());
+        assert!(renderers_a.has_same_parser_configuration(&renderers_b));
+    }
 }

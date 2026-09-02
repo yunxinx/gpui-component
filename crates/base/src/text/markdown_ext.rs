@@ -689,14 +689,25 @@ impl MarkdownExtensions {
     /// Render methods commonly rebuild equivalent plugin closures every frame.
     /// Their globally unique revisions differ, but the parser shape remains
     /// stable; render handles may be refreshed without reparsing the document.
+    ///
+    /// Every field that participates in producing the document is compared:
+    /// parser flags, parse-option configurers, source preparers, block and
+    /// inline parsers, and the renderer name sets (a node claimed by a parser
+    /// without a renderer falls back differently). `parse_error_formatter`
+    /// is deliberately excluded because it only runs while rendering.
     pub(crate) fn has_same_parser_configuration(&self, other: &Self) -> bool {
+        fn same_keys<V>(a: &HashMap<SharedString, V>, b: &HashMap<SharedString, V>) -> bool {
+            a.len() == b.len() && a.keys().all(|name| b.contains_key(name))
+        }
+
         self.enable_mdx == other.enable_mdx
+            && self.enable_cjk_emphasis_compatibility == other.enable_cjk_emphasis_compatibility
+            && self.parse_options_configurers.len() == other.parse_options_configurers.len()
+            && self.source_preparers.len() == other.source_preparers.len()
             && self.block_parsers.len() == other.block_parsers.len()
-            && self.block_renderers.len() == other.block_renderers.len()
-            && self
-                .block_renderers
-                .keys()
-                .all(|name| other.block_renderers.contains_key(name))
+            && self.inline_parsers.len() == other.inline_parsers.len()
+            && same_keys(&self.block_renderers, &other.block_renderers)
+            && same_keys(&self.inline_renderers, &other.inline_renderers)
     }
 
     pub(crate) fn push_block_parser<F>(&mut self, parser: F)
