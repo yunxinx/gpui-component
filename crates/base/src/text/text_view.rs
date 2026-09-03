@@ -1749,6 +1749,79 @@ mod tests {
         );
     }
 
+    struct ImageSourceCopyTestRoot {
+        text_view: Entity<TextViewState>,
+    }
+
+    impl Render for ImageSourceCopyTestRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(480.))
+                .child(crate::TextSelectionLayer)
+                .child(
+                    div()
+                        .debug_selector(|| "image-source-copy-root".into())
+                        .child(
+                            TextView::new(&self.text_view)
+                                .selectable(true)
+                                .selection_format(crate::text::SelectionFormat::Source),
+                        ),
+                )
+                .child(div().h(px(40.)).child("footer"))
+        }
+    }
+
+    /// A Source-format drag that covers an inline image reconstructs the image
+    /// Markdown between the surrounding text runs.
+    #[gpui::test]
+    fn source_drag_across_inline_image_reconstructs_image_markdown(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let text_view = cx.update(|cx| {
+            cx.new(|cx| TextViewState::markdown("before ![alt](https://e.test/a.svg) after", cx))
+        });
+        let (_, cx) = cx.add_window_view(|_, _| ImageSourceCopyTestRoot {
+            text_view: text_view.clone(),
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let root = cx
+            .debug_bounds("image-source-copy-root")
+            .expect("paragraph bounds");
+        let y = root.top() + px(6.);
+        cx.simulate_mouse_down(
+            point(root.left() + px(1.), y),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_move(
+            point(root.right() - px(1.), y),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_up(
+            point(root.right() - px(1.), y),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+
+        let selected = text_view.read_with(cx, |state, _| state.selected_text());
+        assert_eq!(
+            selected.trim(),
+            "before ![alt](https://e.test/a.svg) after",
+            "the image must be reconstructed inside the selected source"
+        );
+    }
+
     #[gpui::test]
     fn double_click_selects_word(cx: &mut TestAppContext) {
         cx.update(crate::init);
