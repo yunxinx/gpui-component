@@ -248,6 +248,35 @@ mod tests {
         });
     }
 
+    /// Changing the theme is what carries a new `HighlightTheme` into rendered
+    /// code blocks: `Theme::change` must reinstall the text view defaults with
+    /// a highlighter built from the switched theme, since the defaults are the
+    /// only path from the component theme to `gpui_base` code blocks.
+    #[cfg(feature = "tree-sitter")]
+    #[gpui::test]
+    fn theme_change_reinstalls_the_default_code_highlighter(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        cx.update(|cx| {
+            gpui_base::TextViewDefaults::new().install(cx);
+            assert!(!gpui_base::TextViewDefaults::global(cx).has_code_block_highlighter());
+        });
+
+        cx.update(|cx| {
+            Theme::change(crate::ThemeMode::Dark, None, cx);
+        });
+
+        cx.update(|cx| {
+            assert!(
+                gpui_base::TextViewDefaults::global(cx).has_code_block_highlighter(),
+                "a theme change must reinstall the default code block highlighter"
+            );
+            assert!(
+                Theme::global(cx).is_dark(),
+                "the reinstalled highlighter is built from the switched theme"
+            );
+        });
+    }
+
     #[test]
     fn legacy_text_paths_reexport_base_implementation() {
         let mut style = super::TextViewStyle::default();

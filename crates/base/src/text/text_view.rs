@@ -2611,4 +2611,122 @@ mod tests {
             "scrollbar track click was covered by Markdown code content: before={before:?} after={after:?}"
         );
     }
+
+    struct DefaultHighlighterCodeBlockRoot {
+        text_view: Entity<TextViewState>,
+    }
+
+    impl Render for DefaultHighlighterCodeBlockRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(480.)).child(TextView::new(&self.text_view))
+        }
+    }
+
+    /// Installs application defaults whose highlighter counts its calls and
+    /// paints the whole block in `color`.
+    fn install_counting_default_highlighter(color: Hsla, cx: &mut gpui::App) -> Arc<AtomicUsize> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        super::TextViewDefaults::new()
+            .with_code_block_highlighter(move |block| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                vec![(
+                    0..block.code().len(),
+                    gpui::HighlightStyle {
+                        color: Some(color),
+                        ..Default::default()
+                    },
+                )]
+            })
+            .install(cx);
+        calls
+    }
+
+    /// A theme change reaches a rendered code block by reinstalling
+    /// `TextViewDefaults` with a highlighter built for the new theme. The
+    /// drawn block must pick up that highlighter on the next frame without the
+    /// Markdown document being parsed again.
+    #[gpui::test]
+    fn rendered_code_block_follows_new_default_highlighter_without_reparsing(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let light_calls =
+            cx.update(|cx| install_counting_default_highlighter(gpui::rgb(0x0000ff).into(), cx));
+        let (view, cx) = cx.add_window_view(|_, cx| DefaultHighlighterCodeBlockRoot {
+            text_view: cx.new(|cx| TextViewState::markdown("```json\n{\"value\": 42}\n```", cx)),
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let (blocks_before, light_block) = view.read_with(cx, |root, cx| {
+            let document = &root.text_view.read(cx).parsed_content.document;
+            let crate::text::node::BlockNode::CodeBlock(block) = &document.blocks[0] else {
+                panic!("expected a code block");
+            };
+            (document.blocks.clone(), block.clone())
+        });
+        assert!(
+            light_calls.load(Ordering::Relaxed) >= 1,
+            "the installed default highlighter must style the drawn block"
+        );
+        let light_highlighter = cx.update(|_, cx| {
+            super::TextViewDefaults::global(cx)
+                .code_block_highlighter
+                .expect("light defaults installed")
+        });
+        assert_eq!(
+            light_block.highlighted_styles(&light_highlighter)[0]
+                .1
+                .color,
+            Some(gpui::rgb(0x0000ff).into())
+        );
+        let light_calls_after_first_frame = light_calls.load(Ordering::Relaxed);
+
+        let dark_calls =
+            cx.update(|_, cx| install_counting_default_highlighter(gpui::rgb(0xffff00).into(), cx));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let (blocks_after, dark_block) = view.read_with(cx, |root, cx| {
+            let document = &root.text_view.read(cx).parsed_content.document;
+            let crate::text::node::BlockNode::CodeBlock(block) = &document.blocks[0] else {
+                panic!("expected a code block");
+            };
+            (document.blocks.clone(), block.clone())
+        });
+        assert!(
+            Arc::ptr_eq(&blocks_before, &blocks_after),
+            "swapping the default highlighter must not reparse the Markdown document"
+        );
+        assert!(
+            dark_calls.load(Ordering::Relaxed) >= 1,
+            "the drawn block must be restyled by the new default highlighter"
+        );
+        assert_eq!(
+            light_calls.load(Ordering::Relaxed),
+            light_calls_after_first_frame,
+            "the replaced highlighter must not be consulted again"
+        );
+        let dark_highlighter = cx.update(|_, cx| {
+            super::TextViewDefaults::global(cx)
+                .code_block_highlighter
+                .expect("dark defaults installed")
+        });
+        assert_eq!(
+            dark_block.highlighted_styles(&dark_highlighter)[0].1.color,
+            Some(gpui::rgb(0xffff00).into()),
+            "the block's cached styles must follow the new highlighter"
+        );
+        assert_eq!(
+            dark_calls.load(Ordering::Relaxed),
+            1,
+            "reading the styles for the installed highlighter must hit the block's cache"
+        );
+    }
 }

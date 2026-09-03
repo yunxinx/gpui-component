@@ -1434,7 +1434,7 @@ impl CodeBlock {
         }
     }
 
-    fn highlighted_styles(
+    pub(super) fn highlighted_styles(
         &self,
         highlighter: &Arc<CodeBlockHighlighterFn>,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
