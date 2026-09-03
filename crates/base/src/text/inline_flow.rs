@@ -780,12 +780,14 @@ impl Element for InlineFlow {
                 } => {
                     element.paint(window, cx);
                     paint_atomic_selection(
-                        state,
-                        text,
-                        link,
-                        self.link_click_handler.clone(),
-                        *bounds,
-                        hitbox,
+                        AtomicSelectionPaint {
+                            inline_state: state,
+                            text,
+                            link,
+                            link_click_handler: self.link_click_handler.clone(),
+                            bounds: *bounds,
+                            hitbox,
+                        },
                         window,
                         cx,
                     );
@@ -795,16 +797,25 @@ impl Element for InlineFlow {
     }
 }
 
-fn paint_atomic_selection(
-    inline_state: &Arc<Mutex<InlineState>>,
-    text: &SharedString,
-    link: &Option<LinkMark>,
+/// One atomic (custom) fragment's geometry and selection state for painting.
+struct AtomicSelectionPaint<'a> {
+    inline_state: &'a Arc<Mutex<InlineState>>,
+    text: &'a SharedString,
+    link: &'a Option<LinkMark>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     bounds: Bounds<Pixels>,
-    hitbox: &Hitbox,
-    window: &mut Window,
-    cx: &mut App,
-) {
+    hitbox: &'a Hitbox,
+}
+
+fn paint_atomic_selection(paint: AtomicSelectionPaint<'_>, window: &mut Window, cx: &mut App) {
+    let AtomicSelectionPaint {
+        inline_state,
+        text,
+        link,
+        link_click_handler,
+        bounds,
+        hitbox,
+    } = paint;
     let Some(text_view_state) = GlobalState::global(cx).text_view_state().cloned() else {
         return;
     };
