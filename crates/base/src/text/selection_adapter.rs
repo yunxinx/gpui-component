@@ -190,6 +190,12 @@ impl TextViewSelectionAdapter {
         self.text_bounds.extend(bounds);
     }
 
+    /// The inline text bounds registered during the last painted frame.
+    #[cfg(test)]
+    pub(super) fn registered_text_bounds(&self) -> &[Bounds<Pixels>] {
+        &self.text_bounds
+    }
+
     pub(super) fn register(
         &self,
         hitbox: Hitbox,
@@ -216,6 +222,10 @@ impl TextViewSelectionAdapter {
 
     pub(super) fn set_local_selection(&self, active: bool, cx: &mut App) {
         self.selection.set_local_selection(active, cx);
+    }
+
+    pub(super) fn set_preserve_copy_boundaries(&self, preserve: bool, cx: &mut App) {
+        self.selection.set_preserve_copy_boundaries(preserve, cx);
     }
 
     pub(super) fn is_part_of_window_selection(&self, cx: &App) -> bool {

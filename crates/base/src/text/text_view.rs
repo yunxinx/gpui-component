@@ -10,7 +10,9 @@ use gpui::{
 
 use crate::StyledExt;
 use crate::text::TextViewFormat;
-use crate::text::markdown_ext::{MarkdownExtensions, MarkdownNode, MarkdownPlugin};
+use crate::text::markdown_ext::{
+    MarkdownExtensions, MarkdownInline, MarkdownInlineRenderContext, MarkdownNode, MarkdownPlugin,
+};
 use crate::text::node::{CodeBlock, TableData};
 use crate::text::state::{LineSpan, SelectionFormat, TextViewState};
 use crate::{GlobalState, TextSelection, text::TextViewStyle};
@@ -403,6 +405,67 @@ impl TextView {
         self
     }
 
+    /// Configure the `markdown-rs` options used by this TextView.
+    pub fn markdown_parse_options<F>(mut self, configure: F) -> Self
+    where
+        F: Fn(&mut markdown::ParseOptions) + Send + Sync + 'static,
+    {
+        Arc::make_mut(&mut self.markdown_extensions).push_parse_options(configure);
+        self
+    }
+
+    /// Register a length-preserving source preparation step.
+    pub fn markdown_prepare_source<F>(mut self, prepare: F) -> Self
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        Arc::make_mut(&mut self.markdown_extensions).push_source_preparer(prepare);
+        self
+    }
+
+    /// Register a fallible length-preserving source preparation step.
+    pub fn markdown_try_prepare_source<F, E>(mut self, prepare: F) -> Self
+    where
+        F: Fn(&str) -> Result<String, E> + Send + Sync + 'static,
+        E: Into<SharedString>,
+    {
+        Arc::make_mut(&mut self.markdown_extensions)
+            .push_try_source_preparer(move |source| prepare(source).map_err(Into::into));
+        self
+    }
+
+    /// Register a custom inline-level Markdown parser.
+    pub fn markdown_inline_parser<F>(mut self, parser: F) -> Self
+    where
+        F: for<'a> Fn(
+                &markdown::mdast::Node,
+                &crate::text::MarkdownParseContext<'a>,
+            ) -> Option<MarkdownNode>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Arc::make_mut(&mut self.markdown_extensions).push_inline_parser(parser);
+        self
+    }
+
+    /// Register a renderer for a custom inline Markdown node name.
+    pub fn markdown_inline_renderer<F>(mut self, name: impl Into<SharedString>, renderer: F) -> Self
+    where
+        F: Fn(
+                &MarkdownNode,
+                &MarkdownInlineRenderContext,
+                &mut Window,
+                &mut App,
+            ) -> Option<MarkdownInline>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Arc::make_mut(&mut self.markdown_extensions).push_inline_renderer(name, renderer);
+        self
+    }
+
     /// Apply a reusable text view plugin.
     pub fn plugin<P>(self, plugin: P) -> Self
     where
@@ -608,8 +671,8 @@ impl Element for TextView {
             .relative()
             .text_color(text_view_style.foreground())
             .on_action(move |_: &crate::input::Copy, window, cx| {
-                let text = TextSelection::selected_text(window, cx).trim().to_string();
-                if text.is_empty() {
+                let text = TextSelection::selected_text_for_copy(window, cx);
+                if text.trim().is_empty() {
                     cx.propagate();
                     return;
                 }
@@ -752,18 +815,26 @@ impl Element for TextView {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        ops::Range,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use super::{TextView, TextViewPlugin};
-    use crate::text::{TableData, TextViewState, TextViewStyle};
+    use crate::text::{
+        InlineFlow, InlineFlowItem, InlineMetrics, MarkdownExtensions, MarkdownInline,
+        MarkdownNode, TableData, TextViewFormat, TextViewState, TextViewStyle,
+    };
+    use crate::theme::ActiveTheme as _;
     use gpui::{
-        AppContext as _, Bounds, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
-        Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Overflow, ParentElement as _, Pixels,
-        Render, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
-        TestAppContext, VisualTestContext, Window, div, point, px,
+        AppContext as _, Bounds, ClickEvent, Context, Entity, FontWeight, Hsla,
+        InteractiveElement as _, IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent,
+        Overflow, ParentElement as _, Pixels, Render, SharedString,
+        StatefulInteractiveElement as _, StyleRefinement, Styled as _, TestAppContext,
+        VisualTestContext, Window, div, point, px,
     };
 
     struct TextViewTestRoot {
@@ -852,6 +923,7 @@ mod tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .w(px(160.))
+                .child(crate::TextSelectionLayer)
                 .child(
                     div()
                         .h(px(24.))
@@ -1821,6 +1893,649 @@ mod tests {
         assert!(
             (max - min) < 2.0,
             "list content total jittered while scrolling: min={min} max={max} totals={totals:?}"
+        );
+    }
+
+    struct TextViewBuilderTestRoot;
+
+    fn text_view_builder_fixture() -> TextView {
+        TextView::markdown("builder", "---\n\nab $x$")
+            .style(TextViewStyle::default())
+            .selectable(true)
+            .scrollable(true)
+            .code_block_actions(|_, _, _| div())
+            .markdown_mdx()
+            .markdown_parse_options(|options| options.constructs.math_text = true)
+            .markdown_prepare_source(|source| source.replace("ab", "cd"))
+            .markdown_try_prepare_source(|source| Ok::<_, &'static str>(source.replace("cd", "ef")))
+            .markdown_block_parser(|node, cx| {
+                let markdown::mdast::Node::ThematicBreak(_) = node else {
+                    return None;
+                };
+                Some(
+                    MarkdownNode::new("builder-block", ())
+                        .text(cx.node_source(node).unwrap_or_default()),
+                )
+            })
+            .markdown_block_renderer("builder-block", |_, _, _| {
+                div()
+                    .debug_selector(|| "text-view-builder-block".into())
+                    .size(px(8.))
+            })
+            .markdown_inline_parser(|node, cx| {
+                let markdown::mdast::Node::InlineMath(_) = node else {
+                    return None;
+                };
+                Some(
+                    MarkdownNode::new("builder-inline", ())
+                        .text(cx.node_source(node).unwrap_or_default()),
+                )
+            })
+            .markdown_inline_renderer("builder-inline", |_, _, _, _| {
+                Some(MarkdownInline::new(
+                    InlineMetrics::new(px(12.), px(8.), px(2.)),
+                    div()
+                        .debug_selector(|| "text-view-builder-inline".into())
+                        .w(px(12.))
+                        .h(px(10.)),
+                ))
+            })
+            .plugin(DummyTextViewPlugin)
+    }
+
+    impl Render for TextViewBuilderTestRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(300.))
+                .h(px(200.))
+                .child(text_view_builder_fixture())
+        }
+    }
+
+    struct InlineFlowStyleTestRoot {
+        small_state: crate::text::InlineFlowState,
+        large_state: crate::text::InlineFlowState,
+    }
+
+    impl InlineFlowStyleTestRoot {
+        fn new() -> Self {
+            Self {
+                small_state: Default::default(),
+                large_state: Default::default(),
+            }
+        }
+    }
+
+    impl Render for InlineFlowStyleTestRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let items = || {
+                vec![
+                    crate::text::InlineFlowItem::text("inherited typography"),
+                    crate::text::InlineFlowItem::custom(
+                        "x",
+                        crate::text::InlineMetrics::new(px(1.), px(1.), px(0.)),
+                        div().w(px(1.)).h(px(1.)),
+                    ),
+                ]
+            };
+
+            crate::v_flex()
+                .child(
+                    div()
+                        .w(px(300.))
+                        .text_size(px(10.))
+                        .debug_selector(|| "inline-flow-small-style".into())
+                        .child(crate::text::InlineFlow::new(
+                            "small-flow",
+                            self.small_state.clone(),
+                            items(),
+                        )),
+                )
+                .child(
+                    div()
+                        .w(px(300.))
+                        .text_size(px(30.))
+                        .debug_selector(|| "inline-flow-large-style".into())
+                        .child(crate::text::InlineFlow::new(
+                            "large-flow",
+                            self.large_state.clone(),
+                            items(),
+                        )),
+                )
+        }
+    }
+
+    struct AtomicInlineFlowTextViewTestRoot {
+        text_view: Entity<TextViewState>,
+        extensions: MarkdownExtensions,
+    }
+
+    impl AtomicInlineFlowTextViewTestRoot {
+        fn new(cx: &mut Context<Self>) -> Self {
+            let extensions = MarkdownExtensions::default()
+                .block_parser(|node, _| {
+                    let markdown::mdast::Node::Paragraph(_) = node else {
+                        return None;
+                    };
+                    Some(
+                        MarkdownNode::new("atomic-inline-flow", ())
+                            .text("before $x$\nafter")
+                            .inline_flow_state(Default::default()),
+                    )
+                })
+                .block_renderer("atomic-inline-flow", |node, _, _| {
+                    InlineFlow::new(
+                        "atomic-inline-flow",
+                        node.attached_inline_flow_state()
+                            .cloned()
+                            .unwrap_or_default(),
+                        vec![
+                            InlineFlowItem::text("before "),
+                            InlineFlowItem::custom(
+                                "$x$",
+                                InlineMetrics::new(px(24.), px(14.), px(4.)),
+                                div()
+                                    .debug_selector(|| "atomic-inline-flow-item".into())
+                                    .w(px(24.))
+                                    .h(px(18.)),
+                            )
+                            .custom_link("https://example.com/formula"),
+                            InlineFlowItem::text("\nafter"),
+                        ],
+                    )
+                });
+            let text_view = cx.new(|cx| TextViewState::markdown("probe", cx));
+            Self {
+                text_view,
+                extensions,
+            }
+        }
+    }
+
+    impl Render for AtomicInlineFlowTextViewTestRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(240.)).child(crate::TextSelectionLayer).child(
+                TextView::new(&self.text_view)
+                    .markdown_extensions(self.extensions.clone())
+                    .selectable(true),
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct InlineRenderSnapshot {
+        heading_level: Option<u8>,
+        font_size: gpui::AbsoluteLength,
+        font_weight: FontWeight,
+        bold: bool,
+        link: Option<String>,
+        source_range: Range<usize>,
+        color: Hsla,
+    }
+
+    struct MarkdownInlinePluginTestRoot {
+        text_view: Entity<TextViewState>,
+        extensions: MarkdownExtensions,
+    }
+
+    impl Render for MarkdownInlinePluginTestRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(320.)).child(
+                TextView::new(&self.text_view)
+                    .markdown_extensions(self.extensions.clone())
+                    .selectable(true),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn inline_flow_measurement_uses_inherited_text_style(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (_, cx) = cx.add_window_view(|_, _| InlineFlowStyleTestRoot::new());
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let small = cx.debug_bounds("inline-flow-small-style").unwrap();
+        let large = cx.debug_bounds("inline-flow-large-style").unwrap();
+        assert!(
+            large.size.height > small.size.height * 2.,
+            "captured 30px typography should measure substantially taller than 10px: {small:?} vs {large:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn markdown_inline_renderer_receives_native_heading_mark_link_and_range(
+        cx: &mut TestAppContext,
+    ) {
+        const SOURCE: &str = "# before **[$x$](https://example.com)** after\n\n> quoted $y$";
+
+        cx.update(crate::init);
+        let snapshots = Arc::new(Mutex::new(Vec::<InlineRenderSnapshot>::new()));
+        let renderer_snapshots = snapshots.clone();
+        let extensions = MarkdownExtensions::default()
+            .parse_options(|options| options.constructs.math_text = true)
+            .inline_parser(|node, _| {
+                let markdown::mdast::Node::InlineMath(math) = node else {
+                    return None;
+                };
+                Some(MarkdownNode::new("math-inline", math.value.clone()))
+            })
+            .inline_renderer("math-inline", move |_, context, _, _| {
+                if let Ok(mut snapshots) = renderer_snapshots.lock() {
+                    snapshots.push(InlineRenderSnapshot {
+                        heading_level: context.heading_level(),
+                        font_size: context.text_style().font_size,
+                        font_weight: context.text_style().font_weight,
+                        bold: context.mark().bold,
+                        link: context.link().map(|link| link.url.to_string()),
+                        source_range: context.source_range(),
+                        color: context.text_style().color,
+                    });
+                }
+                Some(MarkdownInline::new(
+                    InlineMetrics::new(px(24.), px(14.), px(4.)),
+                    div()
+                        .debug_selector(|| "markdown-inline-plugin-item".into())
+                        .w(px(24.))
+                        .h(px(18.)),
+                ))
+            });
+        let text_view = cx.update(|cx| cx.new(|cx| TextViewState::markdown(SOURCE, cx)));
+        let (_, cx) = cx.add_window_view(|_, _| MarkdownInlinePluginTestRoot {
+            text_view: text_view.clone(),
+            extensions,
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(cx.debug_bounds("markdown-inline-plugin-item").is_some());
+        let muted_foreground = cx.update(|_, cx| cx.theme().tokens.colors.muted_foreground);
+        let snapshots = snapshots.lock().unwrap();
+        let heading_start = SOURCE.find("$x$").unwrap();
+        let heading = snapshots
+            .iter()
+            .find(|snapshot| snapshot.source_range.start == heading_start)
+            .expect("heading inline renderer should run");
+        assert_eq!(heading.heading_level, Some(1));
+        assert_eq!(heading.font_size, px(28.).into());
+        assert_eq!(heading.font_weight, FontWeight::BOLD);
+        assert!(heading.bold);
+        assert_eq!(heading.link.as_deref(), Some("https://example.com"));
+        assert_eq!(heading.source_range, heading_start..heading_start + 3);
+
+        let quote_start = SOURCE.find("$y$").unwrap();
+        let quote = snapshots
+            .iter()
+            .find(|snapshot| snapshot.source_range.start == quote_start)
+            .expect("blockquote inline renderer should run");
+        assert_eq!(quote.heading_level, None);
+        assert_eq!(quote.color, muted_foreground);
+    }
+
+    #[gpui::test]
+    fn pending_markdown_inline_renderer_keeps_selectable_delimiter_text(cx: &mut TestAppContext) {
+        const SOURCE: &str = "before **$x$** after";
+
+        cx.update(crate::init);
+        let extensions = MarkdownExtensions::default()
+            .parse_options(|options| options.constructs.math_text = true)
+            .inline_parser(|node, _| {
+                let markdown::mdast::Node::InlineMath(math) = node else {
+                    return None;
+                };
+                Some(MarkdownNode::new("pending-math", math.value.clone()))
+            })
+            .inline_renderer("pending-math", |_, _, _, _| None);
+        let text_view = cx.update(|cx| cx.new(|cx| TextViewState::markdown(SOURCE, cx)));
+        let (_, cx) = cx.add_window_view(|_, _| MarkdownInlinePluginTestRoot {
+            text_view: text_view.clone(),
+            extensions,
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        text_view.update(cx, |state, cx| state.select_all(cx));
+
+        text_view.read_with(cx, |state, _| {
+            assert_eq!(state.selected_text().trim(), "before $x$ after");
+            assert_eq!(state.source().as_ref(), SOURCE);
+        });
+    }
+
+    #[gpui::test]
+    fn atomic_inline_flow_participates_in_drag_selection(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (view, cx) = cx.add_window_view(|_, cx| AtomicInlineFlowTextViewTestRoot::new(cx));
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let atomic_bounds = cx.debug_bounds("atomic-inline-flow-item").unwrap();
+        let registered_bounds = view.read_with(cx, |root, cx| {
+            root.text_view
+                .read(cx)
+                .selection_adapter
+                .registered_text_bounds()
+                .to_vec()
+        });
+        assert!(
+            registered_bounds
+                .iter()
+                .any(|bounds| bounds.contains(&atomic_bounds.center())),
+            "atomic inline bounds were not registered for selection: {atomic_bounds:?} vs {registered_bounds:?}"
+        );
+
+        let right = point(atomic_bounds.right() - px(1.), atomic_bounds.center().y);
+        let left = point(atomic_bounds.left() + px(1.), atomic_bounds.center().y);
+        cx.simulate_mouse_down(right, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_move(left, Some(MouseButton::Left), Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let selected = cx.update(|window, cx| crate::TextSelection::selected_text(window, cx));
+        assert_eq!(selected.trim(), "$x$");
+
+        cx.simulate_mouse_up(left, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            cx.opened_url(),
+            None,
+            "a reverse drag selection must not activate the custom link"
+        );
+
+        cx.simulate_mouse_down(left, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_move(right, Some(MouseButton::Left), Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let selected = cx.update(|window, cx| crate::TextSelection::selected_text(window, cx));
+        assert_eq!(selected.trim(), "$x$");
+        cx.simulate_mouse_up(right, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            cx.opened_url(),
+            None,
+            "a forward drag selection must not activate the custom link"
+        );
+
+        cx.update(|window, cx| {
+            crate::TextSelection::end(window, cx);
+            let _ = window.draw(cx);
+        });
+        cx.simulate_click(atomic_bounds.center(), Modifiers::default());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://example.com/formula")
+        );
+    }
+
+    #[gpui::test]
+    fn atomic_inline_flow_drag_preserves_hard_breaks(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (view, cx) = cx.add_window_view(|_, cx| AtomicInlineFlowTextViewTestRoot::new(cx));
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let mut registered_bounds = view.read_with(cx, |root, cx| {
+            root.text_view
+                .read(cx)
+                .selection_adapter
+                .registered_text_bounds()
+                .to_vec()
+        });
+        registered_bounds.sort_by(|left, right| {
+            left.top()
+                .partial_cmp(&right.top())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    left.left()
+                        .partial_cmp(&right.left())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        assert_eq!(registered_bounds.len(), 3);
+
+        let first = registered_bounds[0];
+        let last = registered_bounds[2];
+        let drag_start = point(last.right() - px(1.), last.center().y);
+        let drag_end = point(first.left() + px(1.), first.center().y);
+        cx.simulate_mouse_down(drag_start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(drag_end, Some(MouseButton::Left), Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let selected = cx.update(|window, cx| crate::TextSelection::selected_text(window, cx));
+        assert_eq!(selected.trim(), "before $x$\nafter");
+    }
+
+    #[gpui::test]
+    fn test_text_view_builder(cx: &mut TestAppContext) {
+        let view = text_view_builder_fixture();
+        let plain = TextView::plain("plain-builder", "**literal**").selectable(true);
+        let plain_helper = crate::text::plain("<literal>");
+
+        assert!(view.format == Some(TextViewFormat::Markdown));
+        assert_eq!(view.text.as_deref(), Some("---\n\nab $x$"));
+        assert!(view.state.is_none());
+        assert!(view.selectable);
+        assert!(view.scrollable);
+        assert!(view.code_block_actions.is_some());
+        assert!(plain.format == Some(TextViewFormat::Plain));
+        assert_eq!(plain.text.as_deref(), Some("**literal**"));
+        assert!(plain.selectable);
+        assert!(plain_helper.format == Some(TextViewFormat::Plain));
+        assert_eq!(plain_helper.text.as_deref(), Some("<literal>"));
+
+        let options = view.markdown_extensions.configured_parse_options();
+        assert!(options.constructs.mdx_expression_text);
+        assert!(options.constructs.math_text);
+        assert_eq!(
+            view.markdown_extensions.prepared_source("ab").unwrap(),
+            "ef"
+        );
+        assert_ne!(view.markdown_extensions.revision(), 0);
+
+        cx.update(crate::init);
+        let (_, cx) = cx.add_window_view(|_, _| TextViewBuilderTestRoot);
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(cx.debug_bounds("text-view-builder-block").is_some());
+        assert!(cx.debug_bounds("text-view-builder-inline").is_some());
+    }
+
+    #[gpui::test]
+    fn plain_text_copy_preserves_source_boundaries(cx: &mut TestAppContext) {
+        const SOURCE: &str = "  **literal**\n";
+
+        cx.update(crate::init);
+        let text_view = cx.update(|cx| cx.new(|cx| TextViewState::plain(SOURCE, cx)));
+        let focus_handle = text_view.read_with(cx, |state, _| state.focus_handle.clone());
+        let (_, cx) = cx.add_window_view(|_, _| TextViewTestRoot {
+            text_view: text_view.clone(),
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            focus_handle.focus(window, cx);
+        });
+        text_view.update(cx, |state, cx| state.select_all(cx));
+        cx.dispatch_action(crate::input::Copy);
+
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(SOURCE.to_string())
+        );
+    }
+
+    #[gpui::test]
+    fn visible_markdown_link_still_opens(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (_, cx) =
+            cx.add_window_view(|_, cx| TextViewTestRoot::new("[visible](https://example.com)", cx));
+        let cx: &mut VisualTestContext = cx;
+
+        cx.simulate_click(point(px(10.), px(10.)), Modifiers::default());
+
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+    }
+
+    #[gpui::test]
+    fn lazy_markdown_streaming_total_does_not_regress(cx: &mut TestAppContext) {
+        struct Root {
+            state: gpui::Entity<crate::text::TextViewState>,
+        }
+
+        impl Render for Root {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .w(px(360.))
+                    .h(px(180.))
+                    .child(TextView::new(&self.state).scrollable(true).size_full())
+            }
+        }
+
+        cx.update(crate::init);
+        let state = cx.update(|cx| {
+            cx.new(|cx| {
+                TextViewState::markdown_with_lazy_scroll_measurement(
+                    &(0..20)
+                        .map(|index| format!("paragraph {index}"))
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                    cx,
+                )
+            })
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Root {
+            state: state.clone(),
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let draw = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        };
+        draw(cx);
+
+        let total = |cx: &mut VisualTestContext| {
+            state.read_with(cx, |state, _| {
+                let list = state.scroll_state();
+                f32::from(list.max_offset_for_scrollbar().y + list.viewport_bounds().size.height)
+            })
+        };
+
+        let mut totals = vec![total(cx)];
+        for index in 1..=20 {
+            state.update(cx, |state, cx| {
+                state.push_str(&format!("\n\nparagraph {index}"), cx);
+            });
+            draw(cx);
+            totals.push(total(cx));
+        }
+
+        assert!(
+            totals.windows(2).all(|pair| pair[1] + 0.1 >= pair[0]),
+            "streaming Markdown content height regressed: {totals:?}"
+        );
+        assert!(
+            totals.last().copied().unwrap_or_default() >= 1500.,
+            "streaming Markdown scrollbar total stopped reflecting appended blocks: {totals:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn markdown_scrollbar_track_remains_interactive_above_code_content(cx: &mut TestAppContext) {
+        struct Root {
+            state: gpui::Entity<crate::text::TextViewState>,
+        }
+
+        impl Render for Root {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .w(px(360.))
+                    .h(px(180.))
+                    .child(TextView::new(&self.state).scrollable(true).size_full())
+            }
+        }
+
+        cx.update(crate::init);
+        cx.update(|cx| {
+            let theme = crate::Theme::global_mut(cx);
+            theme.scrollbar = theme
+                .scrollbar
+                .clone()
+                .with_mode(crate::ScrollbarMode::Always);
+        });
+        let source = (0..80)
+            .map(|index| format!("```text\ncode line {index}\n```"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let state = cx.update(|cx| {
+            cx.new(|cx| TextViewState::markdown_with_lazy_scroll_measurement(&source, cx))
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Root {
+            state: state.clone(),
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let before = state.read_with(cx, |state, _| {
+            state.scroll_state().scroll_px_offset_for_scrollbar()
+        });
+        cx.simulate_click(gpui::point(px(356.), px(150.)), Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let after = state.read_with(cx, |state, _| {
+            state.scroll_state().scroll_px_offset_for_scrollbar()
+        });
+        assert!(
+            after.y < before.y,
+            "scrollbar track click was covered by Markdown code content: before={before:?} after={after:?}"
         );
     }
 }

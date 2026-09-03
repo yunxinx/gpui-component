@@ -123,6 +123,9 @@ pub struct TextViewState {
     revision: usize,
     pub(super) selection_revision: usize,
     compatible_layout_update: bool,
+    /// Height hint for blocks appended before they are measured, captured
+    /// from the last render (the worker result arrives without a window).
+    estimated_block_height: Option<Pixels>,
     parsed_error: Option<SharedString>,
     tx: Sender<UpdateOptions>,
     _parse_task: Task<()>,
@@ -167,6 +170,9 @@ impl TextViewState {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         let selection_adapter = TextViewSelectionAdapter::new(cx.entity().downgrade(), cx);
+        // Plain text is copied verbatim: its leading/trailing whitespace and
+        // final newline are content, not rendering artifacts.
+        selection_adapter.set_preserve_copy_boundaries(format == TextViewFormat::Plain, cx);
 
         let (tx, rx) = unbounded::<UpdateOptions>();
         let (tx_result, rx_result) = unbounded::<ParsedUpdate>();
@@ -188,9 +194,22 @@ impl TextViewState {
                                     let old_count = state.list_state.item_count();
                                     let new_count = content.document.blocks.len();
                                     if new_count > old_count {
-                                        state
-                                            .list_state
-                                            .splice(old_count..old_count, new_count - old_count);
+                                        // Appended blocks keep a bounded height
+                                        // estimate until measured so the
+                                        // scrollbar keeps tracking the stream.
+                                        match state.estimated_block_height {
+                                            Some(height) => {
+                                                state.list_state.splice_with_uniform_height(
+                                                    old_count..old_count,
+                                                    new_count - old_count,
+                                                    height,
+                                                )
+                                            }
+                                            None => state.list_state.splice(
+                                                old_count..old_count,
+                                                new_count - old_count,
+                                            ),
+                                        }
                                     } else if new_count < old_count {
                                         state.list_state.splice(new_count..old_count, 0);
                                     }
@@ -276,6 +295,7 @@ impl TextViewState {
             revision: 0,
             selection_revision: 0,
             compatible_layout_update: false,
+            estimated_block_height: None,
             tx,
             _parse_task,
             _receive_task,
@@ -426,7 +446,9 @@ impl TextViewState {
         let format = self.effective_format();
 
         if self.select_all {
-            if format == SelectionFormat::Source {
+            // Plain text is its own source: return it verbatim rather than the
+            // paragraph rendering, which appends a block-terminating newline.
+            if format == SelectionFormat::Source || self.format == TextViewFormat::Plain {
                 return self.source().to_string();
             }
 
@@ -704,6 +726,10 @@ pub(crate) enum TextViewMultiClickKind {
 
 impl Render for TextViewState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.estimated_block_height = Some(super::document::estimated_block_height(
+            &self.text_view_style,
+            window,
+        ));
         let state = cx.entity();
         let document = self.parsed_content.document.clone();
         let mut node_cx = self.parsed_content.node_cx.clone();

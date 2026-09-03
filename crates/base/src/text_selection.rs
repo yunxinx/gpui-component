@@ -498,20 +498,56 @@ struct CopyItem {
     document_order: u64,
     callback: Option<CopyCallback>,
     fallback: String,
+    preserve_boundaries: bool,
 }
 
-fn resolve_copy_items(mut items: Vec<CopyItem>, cx: &mut App) -> String {
+fn resolved_copy_items(mut items: Vec<CopyItem>, cx: &mut App) -> Vec<(String, bool)> {
     items.sort_by_key(|item| item.document_order);
     items
         .into_iter()
         .map(|item| {
-            item.callback
+            let text = item
+                .callback
                 .map(|callback| callback(cx))
-                .unwrap_or(item.fallback)
+                .unwrap_or(item.fallback);
+            (text, item.preserve_boundaries)
         })
-        .filter(|text| !text.trim().is_empty())
+        .filter(|(text, _)| !text.trim().is_empty())
+        .collect()
+}
+
+fn resolve_copy_items(items: Vec<CopyItem>, cx: &mut App) -> String {
+    resolved_copy_items(items, cx)
+        .into_iter()
+        .map(|(text, _)| text)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Joins the selected items for the clipboard. Rendered text is trimmed at the
+/// outer edges, but a participant that preserves boundaries (plain text whose
+/// whitespace is content) keeps its leading and trailing whitespace when it is
+/// the first or last item.
+fn resolve_copy_items_for_copy(items: Vec<CopyItem>, cx: &mut App) -> String {
+    let items = resolved_copy_items(items, cx);
+    let preserve_start = items.first().is_some_and(|(_, preserve)| *preserve);
+    let preserve_end = items.last().is_some_and(|(_, preserve)| *preserve);
+    let text = items
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let start = if preserve_start {
+        0
+    } else {
+        text.len() - text.trim_start().len()
+    };
+    let end = if preserve_end {
+        text.len()
+    } else {
+        text.trim_end().len()
+    };
+    text[start..end.max(start)].to_string()
 }
 
 fn dispatch_clear_handlers(handlers: Vec<ClearHandler>, cx: &mut App) {
@@ -525,6 +561,9 @@ struct SelectableTextState {
     projected_copy_text: Option<String>,
     runs: Vec<TextSelectionRun>,
     local_selection: bool,
+    /// Whether this participant's text keeps its outer whitespace when it
+    /// starts or ends a copied selection.
+    preserve_copy_boundaries: bool,
     snapshot: Option<TextSelectionSnapshot>,
     on_focus: Option<FocusCallback>,
     clear: Option<ClearHandler>,
@@ -541,6 +580,7 @@ impl SelectableTextState {
             projected_copy_text: None,
             runs: Vec::new(),
             local_selection: false,
+            preserve_copy_boundaries: false,
             snapshot: None,
             on_focus: None,
             clear: None,
@@ -654,6 +694,7 @@ impl SelectableTextState {
                 .projected_copy_text
                 .clone()
                 .unwrap_or_else(|| self.fallback_copy_text.clone()),
+            preserve_boundaries: self.preserve_copy_boundaries,
         })
     }
 }
@@ -693,6 +734,13 @@ impl TextSelectionHandle {
     /// Returns whether participant-local selection is active.
     pub fn has_local_selection(&self, cx: &App) -> bool {
         self.0.read(cx).local_selection
+    }
+
+    /// Keeps this participant's leading/trailing whitespace when it begins or
+    /// ends the copied selection (plain text whose whitespace is content).
+    pub fn set_preserve_copy_boundaries(&self, preserve: bool, cx: &mut App) {
+        self.0
+            .update(cx, |state, _| state.preserve_copy_boundaries = preserve);
     }
 
     /// Registers this participant and its geometry for the current frame.
@@ -1633,6 +1681,16 @@ impl TextSelection {
         };
         let items = state.read(cx).copy_items(cx);
         resolve_copy_items(items, cx)
+    }
+
+    /// Returns the selected text prepared for the clipboard: trimmed at the
+    /// outer edges unless the first/last participant preserves its boundaries.
+    pub fn selected_text_for_copy(window: &mut Window, cx: &mut App) -> String {
+        let Some(state) = live_text_selection_state(window, cx) else {
+            return String::new();
+        };
+        let items = state.read(cx).copy_items(cx);
+        resolve_copy_items_for_copy(items, cx)
     }
 
     /// Returns whether the window has a geometry selection or any participant

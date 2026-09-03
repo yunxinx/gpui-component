@@ -6,9 +6,17 @@ use gpui::{
 use std::{ops::RangeInclusive, sync::Arc};
 
 use crate::text::{
-    SelectionFormat,
+    SelectionFormat, TextViewStyle,
     node::{BlockNode, NodeContext},
 };
+
+/// A bounded height estimate for a block that has not been measured yet: one
+/// line plus the paragraph gap. Unknown items otherwise contribute zero height
+/// until they are visited, which makes a growing stream's scrollbar thumb jump
+/// taller and then stop reflecting the document length.
+pub(super) fn estimated_block_height(style: &TextViewStyle, window: &Window) -> gpui::Pixels {
+    window.line_height().max(px(1.)) + style.paragraph_gap().to_pixels(window.rem_size())
+}
 
 /// The parsed document AST.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -209,15 +217,10 @@ impl ParsedDocument {
 
         let blocks = &self.blocks;
         if list_state.item_count() != blocks.len() {
-            // Keep a bounded scrollbar estimate for blocks outside the
-            // viewport. Unknown items otherwise contribute zero height until
-            // they are visited, which makes a growing stream's thumb jump
-            // taller and then stop reflecting the document length.
             let previous_offset = (list_state.item_count() > 0
                 && list_state.viewport_bounds().size.height > px(0.))
             .then(|| list_state.scroll_px_offset_for_scrollbar());
-            let estimated_height = window.line_height().max(px(1.))
-                + node_cx.style.paragraph_gap().to_pixels(window.rem_size());
+            let estimated_height = estimated_block_height(&node_cx.style, window);
             list_state.reset_with_uniform_height(blocks.len(), estimated_height);
             if let Some(previous_offset) = previous_offset {
                 list_state.set_offset_from_scrollbar(previous_offset);
