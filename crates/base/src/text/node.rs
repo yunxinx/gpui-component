@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     sync::{Arc, Mutex},
 };
@@ -1561,13 +1561,30 @@ impl CodeBlock {
     }
 }
 
+/// Normalized and source forms needed to replay a retained definition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetainedDefinitionIdentifier {
+    pub(crate) normalized: SharedString,
+    pub(crate) source: SharedString,
+}
+
 /// A context for rendering nodes, contains link references.
 #[derive(Default, Clone)]
 pub(crate) struct NodeContext {
     /// The byte offset of the node in the original markdown text.
     /// Used for incremental updates.
     pub(crate) offset: usize,
+    /// Reference definitions by normalized identifier, derived from
+    /// `link_definitions`; the render-time lookup table for reference links,
+    /// reference images, and custom inline nodes.
     pub(crate) link_refs: HashMap<SharedString, LinkMark>,
+    /// Source labels keyed by normalized identifier. Incremental Markdown
+    /// parsing uses these to reconstruct retained reference definitions.
+    pub(crate) link_ref_source_identifiers: HashMap<SharedString, SharedString>,
+    /// Link definitions retained independently of their presentation nodes.
+    pub(crate) link_definitions: Vec<LinkDefinitionContext>,
+    /// GFM footnote definitions retained for incremental Markdown parsing.
+    pub(crate) footnote_definitions: Vec<FootnoteDefinitionContext>,
     pub(crate) style: TextViewStyle,
     pub(crate) code_block_actions: Option<Arc<CodeBlockActionsFn>>,
     pub(crate) code_block_highlighter: Option<Arc<CodeBlockHighlighterFn>>,
@@ -1577,17 +1594,157 @@ pub(crate) struct NodeContext {
 }
 
 impl NodeContext {
-    pub(super) fn add_ref(&mut self, identifier: SharedString, link: LinkMark) {
-        self.link_refs.insert(identifier, link);
+    pub(super) fn add_link_definition(
+        &mut self,
+        identifier: SharedString,
+        source_identifier: Option<SharedString>,
+        link: LinkMark,
+        start_offset: Option<usize>,
+    ) {
+        if let Some(source_identifier) = &source_identifier {
+            self.link_ref_source_identifiers
+                .entry(identifier.clone())
+                .or_insert_with(|| source_identifier.clone());
+        }
+        self.link_refs
+            .entry(identifier.clone())
+            .or_insert_with(|| link.clone());
+        self.link_definitions.push(LinkDefinitionContext {
+            identifier,
+            source_identifier,
+            link,
+            start_offset,
+        });
+    }
+
+    fn rebuild_link_refs(&mut self) {
+        self.link_refs.clear();
+        self.link_ref_source_identifiers.clear();
+        for definition in &self.link_definitions {
+            if let Some(source_identifier) = &definition.source_identifier {
+                self.link_ref_source_identifiers
+                    .entry(definition.identifier.clone())
+                    .or_insert_with(|| source_identifier.clone());
+            }
+            self.link_refs
+                .entry(definition.identifier.clone())
+                .or_insert_with(|| definition.link.clone());
+        }
+    }
+
+    pub(super) fn add_footnote_definition(
+        &mut self,
+        identifier: SharedString,
+        source_identifier: Option<SharedString>,
+        start_offset: Option<usize>,
+    ) {
+        self.footnote_definitions.push(FootnoteDefinitionContext {
+            identifier,
+            source_identifier,
+            start_offset,
+        });
+    }
+
+    pub(super) fn take_definition_metadata_from(&mut self, other: &mut Self) {
+        self.link_definitions = std::mem::take(&mut other.link_definitions);
+        self.footnote_definitions = std::mem::take(&mut other.footnote_definitions);
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_footnote_definition(&self, identifier: &str) -> bool {
+        self.footnote_definitions
+            .iter()
+            .any(|definition| definition.identifier.as_ref() == identifier)
+    }
+
+    pub(super) fn footnote_definition_identifiers(&self) -> HashSet<SharedString> {
+        self.footnote_definitions
+            .iter()
+            .map(|definition| definition.identifier.clone())
+            .collect()
+    }
+
+    /// Return the normalized identifier and replayable source spelling for
+    /// every retained link definition.
+    pub(super) fn reference_replay_identifiers(&self) -> Vec<RetainedDefinitionIdentifier> {
+        self.link_ref_source_identifiers
+            .iter()
+            .map(|(normalized, source)| RetainedDefinitionIdentifier {
+                normalized: normalized.clone(),
+                source: source.clone(),
+            })
+            .collect()
+    }
+
+    /// Remove definitions from the fragment that is about to be reparsed.
+    /// Missing source positions cannot be partitioned safely.
+    pub(super) fn retain_definitions_before(&mut self, offset: usize) -> bool {
+        if self
+            .link_definitions
+            .iter()
+            .any(|definition| definition.start_offset.is_none())
+            || self
+                .footnote_definitions
+                .iter()
+                .any(|definition| definition.start_offset.is_none())
+        {
+            return false;
+        }
+        self.link_definitions
+            .retain(|definition| definition.start_offset.is_some_and(|start| start < offset));
+        self.footnote_definitions
+            .retain(|definition| definition.start_offset.is_some_and(|start| start < offset));
+        self.rebuild_link_refs();
+        true
+    }
+
+    /// Return one normalized identifier and replayable source spelling for
+    /// every retained footnote. Duplicate definitions only need one
+    /// representative because footnote references resolve document-wide.
+    pub(super) fn footnote_replay_identifiers(&self) -> Option<Vec<RetainedDefinitionIdentifier>> {
+        let mut identifiers = HashMap::<SharedString, Option<SharedString>>::new();
+        for definition in &self.footnote_definitions {
+            let source_identifier = identifiers
+                .entry(definition.identifier.clone())
+                .or_default();
+            if source_identifier.is_none() {
+                *source_identifier = definition.source_identifier.clone();
+            }
+        }
+        identifiers
+            .into_iter()
+            .map(|(normalized, source)| {
+                source.map(|source| RetainedDefinitionIdentifier { normalized, source })
+            })
+            .collect()
     }
 }
 
 impl PartialEq for NodeContext {
     fn eq(&self, other: &Self) -> bool {
-        self.link_refs == other.link_refs && self.style == other.style
+        self.link_refs == other.link_refs
+            && self.link_ref_source_identifiers == other.link_ref_source_identifiers
+            && self.link_definitions == other.link_definitions
+            && self.footnote_definitions == other.footnote_definitions
+            && self.style == other.style
         // Note: code_block_actions, table_actions and markdown_extensions are
         // intentionally not compared (closures can't be compared)
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LinkDefinitionContext {
+    identifier: SharedString,
+    source_identifier: Option<SharedString>,
+    link: LinkMark,
+    start_offset: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FootnoteDefinitionContext {
+    identifier: SharedString,
+    source_identifier: Option<SharedString>,
+    start_offset: Option<usize>,
 }
 
 impl Paragraph {
