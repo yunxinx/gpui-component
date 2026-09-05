@@ -1,13 +1,18 @@
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Hsla, InteractiveElement as _, IntoElement, ListState, ParentElement as _, SharedString,
-    Styled as _, Window, div, px,
+    App, Hsla, InteractiveElement as _, IntoElement, ListState, ParentElement as _, Pixels,
+    SharedString, Styled as _, Window, div, px,
 };
 
 use std::{ops::RangeInclusive, sync::Arc};
 
-use crate::text::{
-    SelectionFormat, TextViewStyle,
-    node::{BlockNode, NodeContext},
+use crate::{
+    ElementExt,
+    text::{
+        SelectionFormat, TextViewStyle,
+        block_heights::{BlockHeightCache, WindowedLayout, windowed_visible_y_range},
+        node::{BlockNode, NodeContext},
+    },
 };
 
 /// A bounded height estimate for a block that has not been measured yet: one
@@ -249,5 +254,55 @@ impl ParsedDocument {
             })
             .size_full(),
         )
+    }
+
+    /// Windowed layout: the document keeps its natural height in the parent
+    /// layout, but only the blocks intersecting the visible y range are
+    /// rendered; everything else is made up of two fixed-height spacers, so
+    /// the container's total height stays Σ block heights and no parent-level
+    /// clipping (`size_full`) is involved.
+    ///
+    /// `measure` receives each visible block's painted height during prepaint
+    /// so the caller can write measurements back into the height cache.
+    pub(super) fn render_windowed(
+        &self,
+        heights: &BlockHeightCache,
+        layout: WindowedLayout,
+        measure: impl Fn(usize, Pixels, &mut App) + Clone + 'static,
+        node_cx: &NodeContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        let Some(range) =
+            windowed_visible_y_range(layout).and_then(|y| heights.block_range_for_y(y))
+        else {
+            return div().id("document");
+        };
+
+        let blocks_len = self.blocks.len();
+        let (first, last) = (*range.start(), *range.end());
+        let head = heights.sum_range(0..first);
+        let tail = heights.sum_range(last + 1..blocks_len);
+
+        div()
+            .id("document")
+            .when(head > px(0.), |this| this.child(div().h(head)))
+            .children((first..=last).map(move |ix| {
+                let is_last = ix + 1 == blocks_len;
+                let measure = measure.clone();
+                div()
+                    .on_prepaint(move |bounds, _, cx| measure(ix, bounds.size.height, cx))
+                    .child(self.blocks[ix].render_block(
+                        NodeRenderOptions {
+                            ix,
+                            is_last,
+                            ..Default::default()
+                        },
+                        node_cx,
+                        window,
+                        cx,
+                    ))
+            }))
+            .when(tail > px(0.), |this| this.child(div().h(tail)))
     }
 }

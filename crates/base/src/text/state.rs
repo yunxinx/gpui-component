@@ -19,6 +19,9 @@ use crate::{
     text::{
         CodeBlockActionsFn, CodeBlockHighlighterFn, LinkClickHandlerFn, MarkdownExtensions,
         TableActionsFn, TextViewStyle,
+        block_heights::{
+            BlockHeightCache, DEFAULT_ESTIMATED_BLOCK_HEIGHT, WindowedLayout, width_bucket,
+        },
         document::ParsedDocument,
         format,
         node::{self, NodeContext},
@@ -96,6 +99,17 @@ pub struct TextViewState {
     pub(super) selection_format: SelectionFormat,
     pub(super) scrollable: bool,
     pub(super) max_lines: Option<usize>,
+    /// Windowed block layout: only the blocks intersecting the window viewport
+    /// (plus overdraw) lay out and paint; the rest are fixed-height spacers.
+    /// The document keeps its natural height. Requires `!scrollable` and no
+    /// `max_lines` clamp, both of which need the full document laid out.
+    pub(super) windowed: bool,
+    /// Bumped whenever the view's [`TextViewStyle`] changes. Heights measured
+    /// under an older revision describe a layout that no longer holds.
+    pub(super) typography_revision: u64,
+    /// Per-block heights backing [`Self::windowed`], aligned with the parsed
+    /// document's blocks.
+    pub(super) block_heights: BlockHeightCache,
     /// Line spans reported by `Inline` during prepaint (collected only while
     /// [`Self::max_lines`] is set); cleared by `TextView` at each frame start.
     pub(super) line_spans: Arc<Mutex<Vec<LineSpan>>>,
@@ -190,10 +204,28 @@ impl TextViewState {
 
                         match parsed_update.result {
                             Ok(content) => {
+                                // Splice the windowed height cache before the
+                                // document is swapped in: the common prefix is
+                                // computed from the blocks this update left
+                                // untouched, so measured heights survive a
+                                // streaming append.
+                                let windowed_prefix = (parsed_update.selection_compatible
+                                    && state.windowed)
+                                    .then(|| {
+                                        state
+                                            .parsed_content
+                                            .document
+                                            .blocks
+                                            .iter()
+                                            .zip(content.document.blocks.iter())
+                                            .take_while(|(old, new)| old.span() == new.span())
+                                            .count()
+                                    });
+                                let new_count = content.document.blocks.len();
                                 if parsed_update.selection_compatible {
                                     let old_count = state.list_state.item_count();
-                                    let new_count = content.document.blocks.len();
-                                    if new_count > old_count {
+                                    let new_list_count = content.document.blocks.len();
+                                    if new_list_count > old_count {
                                         // Appended blocks keep a bounded height
                                         // estimate until measured so the
                                         // scrollbar keeps tracking the stream.
@@ -201,22 +233,33 @@ impl TextViewState {
                                             Some(height) => {
                                                 state.list_state.splice_with_uniform_height(
                                                     old_count..old_count,
-                                                    new_count - old_count,
+                                                    new_list_count - old_count,
                                                     height,
                                                 )
                                             }
                                             None => state.list_state.splice(
                                                 old_count..old_count,
-                                                new_count - old_count,
+                                                new_list_count - old_count,
                                             ),
                                         }
-                                    } else if new_count < old_count {
-                                        state.list_state.splice(new_count..old_count, 0);
+                                    } else if new_list_count < old_count {
+                                        state.list_state.splice(new_list_count..old_count, 0);
                                     }
                                 }
                                 state.parsed_content = content;
                                 state.parsed_error = None;
                                 state.compatible_layout_update = parsed_update.selection_compatible;
+                                if state.windowed {
+                                    let estimated = state
+                                        .estimated_block_height
+                                        .unwrap_or(DEFAULT_ESTIMATED_BLOCK_HEIGHT);
+                                    match windowed_prefix {
+                                        Some(prefix) => {
+                                            state.block_heights.splice(prefix, new_count, estimated)
+                                        }
+                                        None => state.block_heights.reset(new_count, estimated),
+                                    }
+                                }
                                 if parsed_update.selection_compatible && state.scrollable {
                                     // Appends can change the height of the
                                     // retained block at the viewport boundary.
@@ -268,6 +311,9 @@ impl TextViewState {
             selection_format: SelectionFormat::default(),
             scrollable: false,
             max_lines: None,
+            windowed: false,
+            typography_revision: 0,
+            block_heights: BlockHeightCache::default(),
             line_spans: Arc::default(),
             clamped: false,
             // Measure all blocks (not just visible ones) so the scrollbar
@@ -494,6 +540,14 @@ impl TextViewState {
         if parse_synchronously {
             match parse_content(self.format, ParsedContent::default(), &update_options) {
                 Ok(content) => {
+                    if self.windowed {
+                        // A full replacement orphans every measurement.
+                        let estimated = self
+                            .estimated_block_height
+                            .unwrap_or(DEFAULT_ESTIMATED_BLOCK_HEIGHT);
+                        self.block_heights
+                            .reset(content.document.blocks.len(), estimated);
+                    }
                     self.parsed_content = content;
                     self.parsed_error = None;
                     if !self.is_selecting {
@@ -537,25 +591,33 @@ impl TextViewState {
     ///
     /// Only laid-out blocks can be located, which is enough for a selection
     /// endpoint: the user can only put one where they can see it. Returns
-    /// `None` for a view that is not virtualized, where every block paints and
-    /// the range is not needed.
+    /// `None` for a view that is neither virtualized nor windowed, where every
+    /// block paints and the range is not needed.
     pub(super) fn block_ix_at(&self, content_y: Pixels) -> Option<usize> {
-        if !self.scrollable {
-            return None;
-        }
-
-        let origin = self.bounds.origin.y + self.scroll_offset().y;
-        let count = self.list_state.item_count();
-        let mut ix = self.list_state.logical_scroll_top().item_ix;
-        while ix < count {
-            let bounds = self.list_state.bounds_for_item(ix)?;
-            if content_y < bounds.bottom() - origin {
-                return Some(ix);
+        if self.scrollable {
+            let origin = self.bounds.origin.y + self.scroll_offset().y;
+            let count = self.list_state.item_count();
+            let mut ix = self.list_state.logical_scroll_top().item_ix;
+            while ix < count {
+                let bounds = self.list_state.bounds_for_item(ix)?;
+                if content_y < bounds.bottom() - origin {
+                    return Some(ix);
+                }
+                ix += 1;
             }
-            ix += 1;
+
+            return count.checked_sub(1);
         }
 
-        count.checked_sub(1)
+        // The windowed document starts at the element top (no inner scroll),
+        // so the content y maps straight onto the height cache. The prefix
+        // sums let an endpoint resolve its block even when that block has
+        // never painted, which is what lets `selected_text` cover it whole.
+        if self.windowed {
+            return self.block_heights.block_ix_at_y(content_y);
+        }
+
+        None
     }
 
     #[doc(hidden)]
@@ -742,22 +804,65 @@ impl Render for TextViewState {
         node_cx.style = self.text_view_style.clone();
         let parsed_error = self.display_error();
 
+        let windowed = self.windowed && !self.scrollable;
+        let layout = WindowedLayout {
+            element_bounds: self.bounds,
+            viewport_size: window.viewport_size(),
+        };
+        if windowed {
+            // Keep the cache aligned even when no parsed update ran (a late
+            // `windowed` enable), and re-derive the measurement inputs: a
+            // resized or restyled view must drop heights taken under the old
+            // layout.
+            let estimate = self
+                .estimated_block_height
+                .unwrap_or(DEFAULT_ESTIMATED_BLOCK_HEIGHT);
+            self.block_heights.align(document.blocks.len(), estimate);
+            self.block_heights.invalidate(
+                width_bucket(layout.element_bounds.size.width),
+                self.typography_revision,
+            );
+        }
+        let measure_state = state.downgrade();
+
         v_flex()
             .w_full()
             // Clamped content must keep its natural height: stretching it to
             // the capped box would hide the overflow the clamp has to measure.
             .when(self.max_lines.is_none(), |this| this.h_full())
             .map(|this| match parsed_error {
-                None => this.child(document.render_root(
-                    if self.scrollable {
-                        Some(self.list_state.clone())
-                    } else {
-                        None
-                    },
-                    &node_cx,
-                    window,
-                    cx,
-                )),
+                None => this.child(match windowed {
+                    false => document
+                        .render_root(
+                            if self.scrollable {
+                                Some(self.list_state.clone())
+                            } else {
+                                None
+                            },
+                            &node_cx,
+                            window,
+                            cx,
+                        )
+                        .into_any_element(),
+                    true => document
+                        .render_windowed(
+                            &self.block_heights,
+                            layout,
+                            move |ix, height, cx| {
+                                if let Some(state) = measure_state.upgrade() {
+                                    state.update(cx, |state, cx| {
+                                        if state.block_heights.measure(ix, height) {
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            },
+                            &node_cx,
+                            window,
+                            cx,
+                        )
+                        .into_any_element(),
+                }),
                 Some(err) => this.child(
                     v_flex()
                         .gap_1()
