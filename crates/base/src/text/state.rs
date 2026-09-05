@@ -359,6 +359,15 @@ impl TextViewState {
         self.parsed_content.document.source.clone()
     }
 
+    /// The number of top-level blocks in the parsed document.
+    ///
+    /// Lets a consumer gate expensive layout modes (e.g. windowed rendering)
+    /// on structure as well as byte size: many small blocks cost more to lay
+    /// out than one block of the same total bytes.
+    pub fn block_count(&self) -> usize {
+        self.parsed_content.document.blocks.len()
+    }
+
     /// Set whether the text is selectable, default false.
     pub fn selectable(mut self, selectable: bool) -> Self {
         self.selectable = selectable;
