@@ -85,6 +85,13 @@ impl TextView {
         self.inner = self.inner.scrollable(value);
         self
     }
+    /// Renders only the blocks intersecting the viewport (plus overdraw),
+    /// keeping the document's natural height. Ignored when scrollable or
+    /// clamped; see [`gpui_base::TextView::windowed`].
+    pub fn windowed(mut self, value: bool) -> Self {
+        self.inner = self.inner.windowed(value);
+        self
+    }
     /// Clamps the rendered content to `value` lines.
     pub fn max_lines(mut self, value: usize) -> Self {
         self.inner = self.inner.max_lines(value);
