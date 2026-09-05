@@ -55,6 +55,31 @@ let article = TextView::html("article", html_source);
 
 `scrollable(true)` makes the view fill its container and scroll vertically. Without it, the view grows to fit its content. `max_lines(n)` clamps a non-scrollable preview to at most `n` body-text lines.
 
+## Large documents in an outer scroll area
+
+Use `windowed(true)` when a large document must retain its natural height while
+an ancestor owns scrolling:
+
+```rust
+TextView::new(&document).windowed(true)
+```
+
+Only blocks inside the current clipped viewport and bounded overdraw are laid
+out. Unvisited blocks reserve estimated heights, including while the whole
+document is offscreen. Width, inherited typography, rem size, rich-text style,
+and content changes invalidate affected measurements. Selection and copying
+still span unvisited blocks.
+
+`TextViewState::block_count()` supports application-owned activation policies.
+`TextViewState::is_layout_complete()` reports whether all windowed blocks have
+current measurements; observe the state to react to parsing and measurement
+changes. A complete layout can become incomplete after reflow or new content.
+Non-windowed layouts return `true`; use `TextViewState::is_windowed()` to
+distinguish the effective mode of the latest layout. Mode changes also notify
+observers.
+This mode does not add a scroll owner and is ignored with `scrollable` or
+`max_lines`. It is off by default.
+
 ## Complete default styling
 
 Every constructor starts with `TextViewStyle::default()`. The default contains readable neutral foreground, muted, link, selection, code-background, border, heading, paragraph, inline-code, and table styles. A Base-only application does not need to construct a style before rendering text.

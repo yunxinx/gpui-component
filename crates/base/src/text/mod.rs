@@ -11,6 +11,10 @@ mod state;
 mod style;
 mod text_view;
 mod utils;
+mod windowed;
+
+#[cfg(test)]
+mod windowed_tests;
 
 use gpui::{App, ElementId, IntoElement, RenderOnce, SharedString, Window};
 pub use inline::{SelectableText, SelectableTextState};

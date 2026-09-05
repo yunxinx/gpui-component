@@ -24,6 +24,14 @@ pub(crate) type CodeBlockActionsFn =
 pub(crate) type CodeBlockHighlighterFn =
     dyn Fn(&CodeBlock) -> Vec<(Range<usize>, gpui::HighlightStyle)> + Send + Sync;
 
+fn same_callback<T: ?Sized>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// Application-wide defaults for TextViews that do not provide explicit
 /// presentation or syntax-highlighting overrides.
 #[derive(Clone, Default)]
@@ -284,10 +292,9 @@ impl TextView {
         self
     }
 
-    /// Lay out only the blocks that intersect the window viewport (plus two
-    /// viewport heights of overdraw); the rest of the document is made up of
-    /// fixed-height spacers while the view keeps its natural height in the
-    /// parent layout.
+    /// Lay out only the blocks that intersect the current clipped viewport
+    /// (plus two viewport heights of overdraw), retaining estimated or measured
+    /// heights for the rest of the document in the parent layout.
     ///
     /// Unlike [`Self::scrollable`], which virtualizes into a fixed-height
     /// viewport, windowed mode suits large documents that must size themselves
@@ -296,8 +303,8 @@ impl TextView {
     /// total converges. Selection and copying still cover blocks outside the
     /// window.
     ///
-    /// Ignored when [`Self::scrollable`] or [`Self::max_lines`] is set, both of
-    /// which need the full document laid out. Default is false.
+    /// Ignored when [`Self::scrollable`] or [`Self::max_lines`] is set.
+    /// Default is false.
     pub fn windowed(mut self, windowed: bool) -> Self {
         self.windowed = windowed;
         self
@@ -659,6 +666,12 @@ impl Element for TextView {
             .or(defaults.code_block_highlighter);
 
         state.update(cx, |state, cx| {
+            let mode_changed = state.windowed != windowed;
+            if !same_callback(&state.table_actions, &self.table_actions)
+                || !same_callback(&state.code_block_highlighter, &code_block_highlighter)
+            {
+                state.renderer_revision = state.renderer_revision.wrapping_add(1);
+            }
             state.code_block_actions = self.code_block_actions.clone();
             state.code_block_highlighter = code_block_highlighter.clone();
             state.table_actions = self.table_actions.clone();
@@ -671,15 +684,14 @@ impl Element for TextView {
             state.max_lines = max_lines;
             if state.text_view_style != text_view_style {
                 state.selection_revision = state.selection_revision.wrapping_add(1);
-                // Heights measured under the previous style describe a layout
-                // that no longer holds; the windowed cache drops them on the
-                // next frame through this revision.
-                state.typography_revision = state.typography_revision.wrapping_add(1);
             }
             state.text_view_style = text_view_style.clone();
 
             if let Some(text) = self.text.clone() {
                 state.set_text(text.as_str(), cx);
+            }
+            if mode_changed {
+                cx.defer_in(window, |_, _, cx| cx.notify());
             }
         });
 
@@ -858,7 +870,7 @@ mod tests {
     use super::{TextView, TextViewPlugin};
     use crate::text::{
         InlineFlow, InlineFlowItem, InlineMetrics, MarkdownExtensions, MarkdownInline,
-        MarkdownNode, SelectionFormat, TableData, TextViewFormat, TextViewState, TextViewStyle,
+        MarkdownNode, TableData, TextViewFormat, TextViewState, TextViewStyle,
     };
     use crate::theme::ActiveTheme as _;
     use gpui::{
@@ -2449,6 +2461,13 @@ mod tests {
         assert!(view.state.is_none());
         assert!(view.selectable);
         assert!(view.scrollable);
+        assert!(!view.windowed);
+        assert!(!plain.windowed);
+        assert!(
+            TextView::markdown("windowed-builder", "text")
+                .windowed(true)
+                .windowed
+        );
         assert!(view.code_block_actions.is_some());
         assert!(plain.format == Some(TextViewFormat::Plain));
         assert_eq!(plain.text.as_deref(), Some("**literal**"));
@@ -2760,230 +2779,5 @@ mod tests {
             1,
             "reading the styles for the installed highlighter must hit the block's cache"
         );
-    }
-
-    #[test]
-    fn windowed_defaults_to_off() {
-        assert!(!TextView::markdown("windowed-default", "text").windowed);
-        assert!(!TextView::plain("windowed-plain", "text").windowed);
-    }
-
-    /// A root hosting one paragraph document, windowed or not.
-    struct WindowedParagraphRoot {
-        text_view: Entity<TextViewState>,
-        windowed: bool,
-        selection_format: SelectionFormat,
-    }
-
-    impl WindowedParagraphRoot {
-        fn paragraphs(count: usize, two_line: bool) -> String {
-            (0..count)
-                .map(|ix| {
-                    if two_line {
-                        format!("para {ix}\nline two")
-                    } else {
-                        format!("para {ix}")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        }
-    }
-
-    impl Render for WindowedParagraphRoot {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().w(px(400.)).child(
-                TextView::new(&self.text_view)
-                    .windowed(self.windowed)
-                    .selection_format(self.selection_format),
-            )
-        }
-    }
-
-    /// Draws the paragraph document and returns the view's content height, how
-    /// many blocks carry a written-back measurement, and the block-range walk
-    /// of the whole document.
-    fn draw_paragraph_document(
-        cx: &mut TestAppContext,
-        windowed: bool,
-        two_line: bool,
-    ) -> (Pixels, usize, String) {
-        cx.update(crate::init);
-        let text = WindowedParagraphRoot::paragraphs(400, two_line);
-        let (root, cx) = cx.add_window_view(|_, cx| WindowedParagraphRoot {
-            text_view: cx.new(|cx| TextViewState::markdown(&text, cx)),
-            windowed,
-            selection_format: SelectionFormat::Plain,
-        });
-        let cx: &mut VisualTestContext = cx;
-        cx.run_until_parked();
-        // The first frame renders under the fallback range and the zero-width
-        // bucket; later frames converge at the real element bounds.
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-
-        root.read_with(cx, |root, cx| {
-            let state = root.text_view.read(cx);
-            (
-                state.bounds().size.height,
-                state.block_heights.measured_count(),
-                // The whole-range walk the windowed copy path takes, evaluated
-                // against the same document.
-                state.selected_text_in(Some(0..=state.parsed_content.document.blocks.len() - 1)),
-            )
-        })
-    }
-
-    /// Only the visible (plus overdraw) blocks may lay out — the rest of the
-    /// document never reports a measurement — while the one-line document,
-    /// whose per-block estimate is exact, keeps the total height of the fully
-    /// painted view.
-    #[gpui::test]
-    fn windowed_layout_paints_a_bounded_range_at_the_same_total_height(cx: &mut TestAppContext) {
-        let (plain_height, _plain_measured, plain_range_text) =
-            draw_paragraph_document(cx, false, false);
-        let (windowed_height, _windowed_measured, windowed_range_text) =
-            draw_paragraph_document(cx, true, false);
-
-        assert!(
-            (windowed_height - plain_height).abs() <= plain_height * 0.05,
-            "spacer-backed height {windowed_height} must match the natural {plain_height}"
-        );
-        // One-line paragraphs are estimated exactly, so the block-range walk
-        // reproduces the painted walk byte for byte.
-        assert_eq!(windowed_range_text, plain_range_text);
-
-        // Two-line paragraphs measure taller than the estimate, so a written
-        // back measurement proves the block painted — and only the bounded
-        // visible range may paint out of 400 blocks.
-        let (two_line_windowed_measured, _) = {
-            let (height, measured, _) = draw_paragraph_document(cx, true, true);
-            (measured, height)
-        };
-        assert!(
-            two_line_windowed_measured > 0 && two_line_windowed_measured < 400,
-            "the windowed view must measure only the visible range, measured {two_line_windowed_measured}"
-        );
-    }
-
-    /// A clipped windowed view over a tall document, with a blank footer below
-    /// so a drag can extend past the clip.
-    struct WindowedSelectionRoot {
-        text_view: Entity<TextViewState>,
-        windowed: bool,
-    }
-
-    impl Render for WindowedSelectionRoot {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .w(px(200.))
-                .child(crate::TextSelectionLayer)
-                .child(
-                    div()
-                        .h(px(40.))
-                        .overflow_hidden()
-                        .child(TextView::new(&self.text_view).windowed(self.windowed)),
-                )
-                .child(div().h(px(160.)))
-        }
-    }
-
-    /// Drags from the first visible paragraph into the footer and returns the
-    /// copied text plus the two block-range evaluations of the same state.
-    fn drag_copy(cx: &mut TestAppContext, windowed: bool) -> (String, String, String) {
-        cx.update(crate::init);
-        let (root, cx) = cx.add_window_view(|_, cx| WindowedSelectionRoot {
-            text_view: cx
-                .new(|cx| TextViewState::markdown("alpha\n\nbravo\n\ncharlie\n\ndelta", cx)),
-            windowed,
-        });
-        let cx: &mut VisualTestContext = cx;
-        let cx: &mut VisualTestContext = cx;
-
-        cx.run_until_parked();
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-        cx.simulate_mouse_down(
-            point(px(2.), px(8.)),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-        cx.simulate_mouse_move(
-            point(px(180.), px(150.)),
-            Some(MouseButton::Left),
-            Modifiers::default(),
-        );
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-        cx.simulate_mouse_up(
-            point(px(180.), px(150.)),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-
-        let copied =
-            cx.update(|window, cx| crate::TextSelection::selected_text_for_copy(window, cx));
-        root.read_with(cx, |root, cx| {
-            let state = root.text_view.read(cx);
-            let last = state.parsed_content.document.blocks.len() - 1;
-            (
-                copied,
-                state.selected_text_in(None),
-                state.selected_text_in(Some(0..=last)),
-            )
-        })
-    }
-
-    /// A windowed selection whose drag ends outside the document resolves both
-    /// endpoints to blocks through the height cache and copies exactly what the
-    /// non-windowed view copies for the same gesture.
-    #[gpui::test]
-    fn windowed_copy_matches_the_non_windowed_result(cx: &mut TestAppContext) {
-        let (plain_copied, plain_walk, plain_range) = drag_copy(cx, false);
-        let (windowed_copied, windowed_walk, windowed_range) = drag_copy(cx, true);
-
-        for word in ["alpha", "bravo", "charlie", "delta"] {
-            assert!(
-                windowed_copied.contains(word),
-                "clipped-out text was not copied: {windowed_copied:?}"
-            );
-        }
-        assert_eq!(windowed_copied, plain_copied);
-        assert_eq!(windowed_range, plain_range);
-        // The painted walk and the block-range walk agree on this state.
-        assert_eq!(windowed_walk, windowed_range);
-        assert_eq!(plain_walk, plain_range);
-    }
-
-    #[gpui::test]
-    fn windowed_select_all_returns_the_source(cx: &mut TestAppContext) {
-        cx.update(crate::init);
-        let (root, cx) = cx.add_window_view(|_, cx| WindowedParagraphRoot {
-            text_view: cx.new(|cx| TextViewState::markdown("para **one**\n\npara two", cx)),
-            windowed: true,
-            selection_format: SelectionFormat::Source,
-        });
-        let cx: &mut VisualTestContext = cx;
-        cx.run_until_parked();
-
-        let text_view = root.read_with(cx, |root, _| root.text_view.clone());
-        let source = text_view.read_with(cx, |state, _| state.source().to_string());
-        text_view.update(cx, |state, cx| state.select_all(cx));
-
-        text_view.read_with(cx, |state, _| {
-            assert_eq!(state.selected_text(), source);
-        });
     }
 }

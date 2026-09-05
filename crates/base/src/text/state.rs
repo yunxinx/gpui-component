@@ -19,13 +19,12 @@ use crate::{
     text::{
         CodeBlockActionsFn, CodeBlockHighlighterFn, LinkClickHandlerFn, MarkdownExtensions,
         TableActionsFn, TextViewStyle,
-        block_heights::{
-            BlockHeightCache, DEFAULT_ESTIMATED_BLOCK_HEIGHT, WindowedLayout, width_bucket,
-        },
+        block_heights::{BlockHeightCache, DEFAULT_ESTIMATED_BLOCK_HEIGHT},
         document::ParsedDocument,
         format,
         node::{self, NodeContext},
         selection_adapter::TextViewSelectionAdapter,
+        windowed::WindowedDocument,
     },
     v_flex,
 };
@@ -99,14 +98,10 @@ pub struct TextViewState {
     pub(super) selection_format: SelectionFormat,
     pub(super) scrollable: bool,
     pub(super) max_lines: Option<usize>,
-    /// Windowed block layout: only the blocks intersecting the window viewport
-    /// (plus overdraw) lay out and paint; the rest are fixed-height spacers.
-    /// The document keeps its natural height. Requires `!scrollable` and no
-    /// `max_lines` clamp, both of which need the full document laid out.
+    /// Natural-height layout with only the currently visible blocks and bounded
+    /// overdraw materialized. Incompatible with inner scrolling and line clamps.
     pub(super) windowed: bool,
-    /// Bumped whenever the view's [`TextViewStyle`] changes. Heights measured
-    /// under an older revision describe a layout that no longer holds.
-    pub(super) typography_revision: u64,
+    pub(super) renderer_revision: u64,
     /// Per-block heights backing [`Self::windowed`], aligned with the parsed
     /// document's blocks.
     pub(super) block_heights: BlockHeightCache,
@@ -204,24 +199,10 @@ impl TextViewState {
 
                         match parsed_update.result {
                             Ok(content) => {
-                                // Splice the windowed height cache before the
-                                // document is swapped in: the common prefix is
-                                // computed from the blocks this update left
-                                // untouched, so measured heights survive a
-                                // streaming append.
-                                let windowed_prefix = (parsed_update.selection_compatible
-                                    && state.windowed)
-                                    .then(|| {
-                                        state
-                                            .parsed_content
-                                            .document
-                                            .blocks
-                                            .iter()
-                                            .zip(content.document.blocks.iter())
-                                            .take_while(|(old, new)| old.span() == new.span())
-                                            .count()
-                                    });
-                                let new_count = content.document.blocks.len();
+                                state.update_block_heights(
+                                    &content,
+                                    parsed_update.selection_compatible,
+                                );
                                 if parsed_update.selection_compatible {
                                     let old_count = state.list_state.item_count();
                                     let new_list_count = content.document.blocks.len();
@@ -249,17 +230,6 @@ impl TextViewState {
                                 state.parsed_content = content;
                                 state.parsed_error = None;
                                 state.compatible_layout_update = parsed_update.selection_compatible;
-                                if state.windowed {
-                                    let estimated = state
-                                        .estimated_block_height
-                                        .unwrap_or(DEFAULT_ESTIMATED_BLOCK_HEIGHT);
-                                    match windowed_prefix {
-                                        Some(prefix) => {
-                                            state.block_heights.splice(prefix, new_count, estimated)
-                                        }
-                                        None => state.block_heights.reset(new_count, estimated),
-                                    }
-                                }
                                 if parsed_update.selection_compatible && state.scrollable {
                                     // Appends can change the height of the
                                     // retained block at the viewport boundary.
@@ -312,7 +282,7 @@ impl TextViewState {
             scrollable: false,
             max_lines: None,
             windowed: false,
-            typography_revision: 0,
+            renderer_revision: 0,
             block_heights: BlockHeightCache::default(),
             line_spans: Arc::default(),
             clamped: false,
@@ -366,6 +336,23 @@ impl TextViewState {
     /// out than one block of the same total bytes.
     pub fn block_count(&self) -> usize {
         self.parsed_content.document.blocks.len()
+    }
+
+    /// Whether the latest layout uses windowed block measurement.
+    ///
+    /// This reflects the effective mode after `scrollable` and `max_lines`
+    /// are applied, rather than only the requested builder option.
+    pub fn is_windowed(&self) -> bool {
+        self.windowed
+    }
+
+    /// Whether every block has a measurement for the current windowed layout.
+    ///
+    /// Non-windowed views return true. Observe this state and use
+    /// [`Self::is_windowed`] to distinguish the active layout mode. Changes
+    /// notify observers along with document and layout updates.
+    pub fn is_layout_complete(&self) -> bool {
+        !self.windowed || self.block_heights.is_complete()
     }
 
     /// Set whether the text is selectable, default false.
@@ -446,6 +433,8 @@ impl TextViewState {
         if self.markdown_extensions.revision() == markdown_extensions.revision() {
             return;
         }
+
+        self.renderer_revision = self.renderer_revision.wrapping_add(1);
 
         let parser_configuration_changed = !self
             .markdown_extensions
@@ -549,14 +538,7 @@ impl TextViewState {
         if parse_synchronously {
             match parse_content(self.format, ParsedContent::default(), &update_options) {
                 Ok(content) => {
-                    if self.windowed {
-                        // A full replacement orphans every measurement.
-                        let estimated = self
-                            .estimated_block_height
-                            .unwrap_or(DEFAULT_ESTIMATED_BLOCK_HEIGHT);
-                        self.block_heights
-                            .reset(content.document.blocks.len(), estimated);
-                    }
+                    self.update_block_heights(&content, false);
                     self.parsed_content = content;
                     self.parsed_error = None;
                     if !self.is_selecting {
@@ -571,7 +553,11 @@ impl TextViewState {
             // later append extends this baseline instead of parsing the delta
             // as a standalone document.
             _ = self.tx.try_send(update_options);
-            cx.notify();
+            // Builder setters can synchronously parse while a frame is drawing.
+            let state = cx.weak_entity();
+            cx.defer(move |cx| {
+                let _ = state.update(cx, |_, cx| cx.notify());
+            });
             return;
         }
 
@@ -590,7 +576,36 @@ impl TextViewState {
         });
     }
 
-    /// Save bounds and unselect if bounds changed.
+    fn update_block_heights(&mut self, content: &ParsedContent, append: bool) {
+        let estimated = self
+            .estimated_block_height
+            .unwrap_or(DEFAULT_ESTIMATED_BLOCK_HEIGHT);
+        if !self.windowed {
+            // A later enable must not reuse measurements from an older document.
+            self.block_heights.reset(0, estimated);
+            return;
+        }
+        let new_blocks = &content.document.blocks;
+        if !append {
+            self.block_heights.reset(new_blocks.len(), estimated);
+            return;
+        }
+
+        let old_blocks = &self.parsed_content.document.blocks;
+        let mut prefix = old_blocks
+            .iter()
+            .zip(new_blocks.iter())
+            .take_while(|(old, new)| old == new)
+            .count();
+        if old_blocks.len() != new_blocks.len() {
+            // The old final block gains a paragraph gap after an insertion.
+            prefix = prefix.min(old_blocks.len().saturating_sub(1));
+        }
+        self.block_heights
+            .splice(prefix, new_blocks.len(), estimated);
+    }
+
+    /// Save the current frame's bounds for selection coordinates.
     pub(super) fn update_bounds(&mut self, bounds: Bounds<Pixels>, _cx: &mut App) {
         self.bounds = bounds;
     }
@@ -720,7 +735,19 @@ impl TextViewState {
     ) {
         let scroll_offset = self.scroll_offset();
         let pos = pos - self.bounds.origin - scroll_offset;
-        self.multi_click_selection = Some(TextViewMultiClickSelection { pos, kind });
+        let block_anchor = self
+            .windowed
+            .then(|| {
+                self.block_heights
+                    .block_ix_at_y(pos.y)
+                    .map(|ix| (ix, pos.y - self.block_heights.sum_range(0..ix)))
+            })
+            .flatten();
+        self.multi_click_selection = Some(TextViewMultiClickSelection {
+            pos,
+            kind,
+            block_anchor,
+        });
         self.selected_text_override = Some(selected_text);
         self.select_all = false;
         self.is_selecting = false;
@@ -745,7 +772,11 @@ impl TextViewState {
         if !self.selectable {
             return None;
         }
-        self.selection_adapter.selection_points(cx)
+        self.selection_adapter.selection_points(
+            self.bounds.origin,
+            self.windowed.then_some(&self.block_heights),
+            cx,
+        )
     }
 
     pub(crate) fn has_selection(&self, cx: &App) -> bool {
@@ -777,8 +808,16 @@ impl TextViewState {
     pub(crate) fn multi_click_selection(&self) -> Option<TextViewMultiClickSelection> {
         let scroll_offset = self.scroll_offset();
         self.multi_click_selection.map(|selection| {
-            let pos = selection.pos + scroll_offset + self.bounds.origin;
-            TextViewMultiClickSelection { pos, ..selection }
+            let mut pos = selection.pos;
+            if self.windowed
+                && let Some((ix, offset)) = selection.block_anchor
+            {
+                pos.y = self.block_heights.sum_range(0..ix) + offset;
+            }
+            TextViewMultiClickSelection {
+                pos: pos + scroll_offset + self.bounds.origin,
+                ..selection
+            }
         })
     }
 }
@@ -787,6 +826,7 @@ impl TextViewState {
 pub(crate) struct TextViewMultiClickSelection {
     pub(crate) pos: Point<Pixels>,
     pub(crate) kind: TextViewMultiClickKind,
+    block_anchor: Option<(usize, Pixels)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -813,32 +853,13 @@ impl Render for TextViewState {
         node_cx.style = self.text_view_style.clone();
         let parsed_error = self.display_error();
 
-        let windowed = self.windowed && !self.scrollable;
-        let layout = WindowedLayout {
-            element_bounds: self.bounds,
-            viewport_size: window.viewport_size(),
-        };
-        if windowed {
-            // Keep the cache aligned even when no parsed update ran (a late
-            // `windowed` enable), and re-derive the measurement inputs: a
-            // resized or restyled view must drop heights taken under the old
-            // layout.
-            let estimate = self
-                .estimated_block_height
-                .unwrap_or(DEFAULT_ESTIMATED_BLOCK_HEIGHT);
-            self.block_heights.align(document.blocks.len(), estimate);
-            self.block_heights.invalidate(
-                width_bucket(layout.element_bounds.size.width),
-                self.typography_revision,
-            );
-        }
-        let measure_state = state.downgrade();
+        let windowed = self.windowed && !self.scrollable && self.max_lines.is_none();
 
         v_flex()
             .w_full()
             // Clamped content must keep its natural height: stretching it to
             // the capped box would hide the overflow the clamp has to measure.
-            .when(self.max_lines.is_none(), |this| this.h_full())
+            .when(self.max_lines.is_none() && !windowed, |this| this.h_full())
             .map(|this| match parsed_error {
                 None => this.child(match windowed {
                     false => document
@@ -853,24 +874,14 @@ impl Render for TextViewState {
                             cx,
                         )
                         .into_any_element(),
-                    true => document
-                        .render_windowed(
-                            &self.block_heights,
-                            layout,
-                            move |ix, height, cx| {
-                                if let Some(state) = measure_state.upgrade() {
-                                    state.update(cx, |state, cx| {
-                                        if state.block_heights.measure(ix, height) {
-                                            cx.notify();
-                                        }
-                                    });
-                                }
-                            },
-                            &node_cx,
-                            window,
-                            cx,
-                        )
-                        .into_any_element(),
+                    true => WindowedDocument::new(
+                        document,
+                        node_cx,
+                        self.block_heights.clone(),
+                        state.downgrade(),
+                        self.renderer_revision,
+                    )
+                    .into_any_element(),
                 }),
                 Some(err) => this.child(
                     v_flex()
@@ -889,7 +900,11 @@ impl Render for TextViewState {
                 ) = {
                     let state = state.read(cx);
                     (
-                        state.bounds().size != bounds.size,
+                        if windowed {
+                            state.bounds().size.width != bounds.size.width
+                        } else {
+                            state.bounds().size != bounds.size
+                        },
                         state.selection_adapter.is_part_of_window_selection(cx),
                         state.selection_adapter.has_selection_snapshot(cx),
                         state.is_selecting,

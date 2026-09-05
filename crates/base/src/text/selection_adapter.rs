@@ -6,12 +6,20 @@ use crate::{
 };
 use gpui::{App, Bounds, EntityId, Hitbox, Pixels, Point, WeakEntity, Window};
 
-use super::TextViewState;
+use super::{TextViewState, block_heights::BlockHeightCache};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CachedBlockEndpoint {
     endpoint: TextSelectionEndpoint,
     block_ix: Option<usize>,
+    offset_in_block: Option<Pixels>,
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedBlockPoint {
+    point: Point<Pixels>,
+    block_ix: usize,
+    offset: Pixels,
 }
 
 #[derive(Default)]
@@ -19,25 +27,66 @@ struct VirtualBlockSelection {
     anchor: Option<CachedBlockEndpoint>,
     cursor: Option<CachedBlockEndpoint>,
     coverage: TextSelectionCoverage,
+    resolved_points: [Option<ResolvedBlockPoint>; 2],
 }
 
 impl VirtualBlockSelection {
-    fn update(&mut self, snapshot: Option<TextSelectionSnapshot>, entity_id: EntityId) {
+    fn update(
+        &mut self,
+        snapshot: Option<TextSelectionSnapshot>,
+        entity_id: EntityId,
+        heights: Option<&BlockHeightCache>,
+    ) {
         let Some(snapshot) = snapshot else {
-            *self = Self::default();
+            self.anchor = None;
+            self.cursor = None;
+            self.coverage = TextSelectionCoverage::default();
             return;
         };
 
         self.coverage = snapshot.coverage();
 
-        Self::update_endpoint(&mut self.anchor, snapshot.anchor(), entity_id);
-        Self::update_endpoint(&mut self.cursor, snapshot.cursor(), entity_id);
+        Self::update_endpoint(
+            &mut self.anchor,
+            snapshot.anchor(),
+            entity_id,
+            heights,
+            &self.resolved_points,
+        );
+        Self::update_endpoint(
+            &mut self.cursor,
+            snapshot.cursor(),
+            entity_id,
+            heights,
+            &self.resolved_points,
+        );
+    }
+
+    fn remember_point(&mut self, point: Point<Pixels>, block_ix: usize, offset: Pixels) {
+        if self
+            .resolved_points
+            .iter()
+            .flatten()
+            .any(|resolved| resolved.point == point && resolved.block_ix == block_ix)
+        {
+            return;
+        }
+        // A press has no non-empty selection snapshot yet. Retain its local
+        // point while subsequent pointer events replace only the moving end.
+        let ix = usize::from(self.resolved_points[0].is_some());
+        self.resolved_points[ix] = Some(ResolvedBlockPoint {
+            point,
+            block_ix,
+            offset,
+        });
     }
 
     fn update_endpoint(
         cached: &mut Option<CachedBlockEndpoint>,
         endpoint: TextSelectionEndpoint,
         entity_id: EntityId,
+        heights: Option<&BlockHeightCache>,
+        resolved_points: &[Option<ResolvedBlockPoint>; 2],
     ) {
         if cached.is_some_and(|cached| cached.endpoint == endpoint) {
             return;
@@ -45,7 +94,21 @@ impl VirtualBlockSelection {
         let block_ix = (endpoint.entity_id() == Some(entity_id))
             .then(|| endpoint.content_key().map(|key| key.value() as usize))
             .flatten();
-        *cached = Some(CachedBlockEndpoint { endpoint, block_ix });
+        let offset_in_block = block_ix.zip(heights).map(|(ix, heights)| {
+            resolved_points
+                .iter()
+                .flatten()
+                .find(|resolved| {
+                    resolved.point == endpoint.content_point() && resolved.block_ix == ix
+                })
+                .map(|resolved| resolved.offset)
+                .unwrap_or_else(|| endpoint.content_point().y - heights.sum_range(0..ix))
+        });
+        *cached = Some(CachedBlockEndpoint {
+            endpoint,
+            block_ix,
+            offset_in_block,
+        });
     }
 
     fn block_range(&self, entity_id: EntityId, last: usize) -> Option<RangeInclusive<usize>> {
@@ -74,6 +137,7 @@ pub(super) struct TextViewSelectionAdapter {
     selection: TextSelectionHandle,
     text_bounds: Vec<Bounds<Pixels>>,
     layout_revision: Option<usize>,
+    virtual_blocks: Rc<RefCell<VirtualBlockSelection>>,
 }
 
 impl TextViewSelectionAdapter {
@@ -90,9 +154,11 @@ impl TextViewSelectionAdapter {
                     TextSelectionEvent::SelectionChanged(snapshot) => {
                         let snapshot = *snapshot;
                         let _ = view_for_events.update(cx, |state, cx| {
-                            blocks_for_events
-                                .borrow_mut()
-                                .update(snapshot, selection_id);
+                            blocks_for_events.borrow_mut().update(
+                                snapshot,
+                                selection_id,
+                                state.windowed.then_some(&state.block_heights),
+                            );
                             state.is_selecting =
                                 snapshot.is_some_and(|snapshot| snapshot.is_selecting());
                             cx.notify();
@@ -143,12 +209,20 @@ impl TextViewSelectionAdapter {
         );
 
         let view_for_content_key = view.clone();
+        let blocks_for_content_key = virtual_blocks.clone();
         selection.resolve_content_key_with(
             move |point, cx| {
                 let view = view_for_content_key.upgrade()?;
-                view.read(cx)
-                    .block_ix_at(point.y)
-                    .map(|block| TextSelectionContentKey::new(block as u64))
+                let state = view.read(cx);
+                let block = state.block_ix_at(point.y)?;
+                if state.windowed {
+                    blocks_for_content_key.borrow_mut().remember_point(
+                        point,
+                        block,
+                        point.y - state.block_heights.sum_range(0..block),
+                    );
+                }
+                Some(TextSelectionContentKey::new(block as u64))
             },
             cx,
         );
@@ -169,6 +243,7 @@ impl TextViewSelectionAdapter {
             selection,
             text_bounds: Vec::new(),
             layout_revision: None,
+            virtual_blocks,
         }
     }
 
@@ -215,9 +290,26 @@ impl TextViewSelectionAdapter {
         );
     }
 
-    pub(super) fn selection_points(&self, cx: &App) -> Option<(Point<Pixels>, Point<Pixels>)> {
+    pub(super) fn selection_points(
+        &self,
+        origin: Point<Pixels>,
+        heights: Option<&BlockHeightCache>,
+        cx: &App,
+    ) -> Option<(Point<Pixels>, Point<Pixels>)> {
         let points = self.selection.snapshot(cx)?.window_points()?;
-        Some((points.anchor(), points.cursor()))
+        let mut anchor = points.anchor();
+        let mut cursor = points.cursor();
+        if let Some(heights) = heights {
+            let blocks = self.virtual_blocks.borrow();
+            for (point, endpoint) in [(&mut anchor, blocks.anchor), (&mut cursor, blocks.cursor)] {
+                if let Some(endpoint) = endpoint
+                    && let (Some(ix), Some(offset)) = (endpoint.block_ix, endpoint.offset_in_block)
+                {
+                    point.y = origin.y + heights.sum_range(0..ix) + offset;
+                }
+            }
+        }
+        Some((anchor, cursor))
     }
 
     pub(super) fn set_local_selection(&self, active: bool, cx: &mut App) {

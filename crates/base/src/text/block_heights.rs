@@ -1,517 +1,715 @@
-use std::{
-    cmp::Ordering,
-    ops::{Range, RangeInclusive},
-};
+use std::{cell::RefCell, ops::Range, rc::Rc};
 
-use gpui::{Bounds, Pixels, Size, px};
+use gpui::{App, Pixels, SharedString, TextStyle, Window, px};
 
-/// Height used for blocks that have not been measured yet when no render has
-/// supplied a real estimate (cache entries created off the UI thread, before
-/// the first paint). The next render replaces it through [`BlockHeightCache::align`].
+use crate::theme::ActiveTheme as _;
+
+use super::TextViewStyle;
+
+/// Initial height before the first layout supplies an inherited-text estimate.
 pub(crate) const DEFAULT_ESTIMATED_BLOCK_HEIGHT: Pixels = px(24.);
 
-/// A height delta at or below this threshold is sub-pixel layout jitter, not
-/// convergence: writing it back would only ask for a frame that lays out the
-/// same thing again.
-const MEASURE_EPSILON: f32 = 0.5;
-
-/// One block's height: an estimate that holds the first frame, replaced by the
-/// measured height once the block paints.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct BlockHeight {
-    pub(crate) estimated: Pixels,
-    pub(crate) measured: Option<Pixels>,
+#[derive(Clone, Copy)]
+struct BlockHeight {
+    height: Pixels,
+    measured_at: Option<u64>,
 }
 
 impl BlockHeight {
-    /// The height layout currently reserves: measurement wins once present.
-    fn effective(self) -> Pixels {
-        self.measured.unwrap_or(self.estimated)
+    fn estimated(height: Pixels) -> Self {
+        Self {
+            height: height.max(px(0.)),
+            measured_at: None,
+        }
+    }
+
+    fn is_measured(self, epoch: u64) -> bool {
+        self.measured_at == Some(epoch)
     }
 }
 
-/// Per-block height bookkeeping for the windowed layout, aligned with the
-/// parsed document's top-level blocks.
-///
-/// Estimates keep the document's total height honest before a block first
-/// paints; measurements replace them as visible blocks converge. Entries are
-/// spliced in place on streaming appends — a full reset would drop measured
-/// heights for blocks the append never touched and make the scrollbar thumb
-/// shrink mid-stream.
-#[derive(Debug, Default)]
-pub(crate) struct BlockHeightCache {
+struct MeasurementIdentity {
+    estimated: Pixels,
+    width: Pixels,
+    typography: BlockTypography,
+    style: TextViewStyle,
+    heading_sizes: [Option<Pixels>; 6],
+    renderer_revision: u64,
+}
+
+/// Inherited text and the code-block typography resolved outside that cascade.
+#[derive(Clone, PartialEq)]
+pub(super) struct BlockTypography {
+    text_style: TextStyle,
+    rem_size: Pixels,
+    code_font: SharedString,
+    code_font_size: Pixels,
+}
+
+impl BlockTypography {
+    pub(super) fn capture(window: &Window, cx: &App) -> Self {
+        let typography = &cx.theme().tokens.typography;
+        Self {
+            text_style: window.text_style(),
+            rem_size: window.rem_size(),
+            code_font: typography.mono.clone(),
+            code_font_size: typography.mono_md.size,
+        }
+    }
+}
+
+#[derive(Default)]
+struct BlockHeights {
     entries: Vec<BlockHeight>,
-    /// Quantized element width the current measurements were taken at.
-    width_bucket: u16,
-    typography_revision: u64,
+    /// Block starts followed by the total height. Accumulate at higher precision
+    /// so fractional heights do not drift over very long documents.
+    offsets: Vec<f64>,
+    measured_count: usize,
+    measurement_epoch: u64,
+    identity: Option<MeasurementIdentity>,
 }
 
-/// Quantizes the element width so measurements survive sub-pixel and small
-/// resizes; a bucket step means real reflow and invalidates them.
-pub(crate) fn width_bucket(width: Pixels) -> u16 {
-    const BUCKET_WIDTH: f32 = 64.;
-    ((f32::from(width) / BUCKET_WIDTH).round().max(0.)) as u16
-}
-
-/// Where the text view sits in the window and the window viewport it is
-/// visible through — the two inputs the windowed visible range derives from.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct WindowedLayout {
-    pub(crate) element_bounds: Bounds<Pixels>,
-    pub(crate) viewport_size: Size<Pixels>,
-}
-
-/// The element-space y range a windowed document has to lay out: the element's
-/// intersection with the window viewport, widened by two viewport heights of
-/// overdraw on each side so a scroll frame never lands on unpainted content
-/// before the next frame can materialize it.
-///
-/// Returns `None` when the element lies entirely outside the viewport. An
-/// element that has never been laid out (zero height) is assumed to sit at the
-/// window top: the first frame materializes one viewport of blocks from the
-/// start instead of nothing, and the measurement writebacks converge the rest.
-pub(crate) fn windowed_visible_y_range(layout: WindowedLayout) -> Option<Range<Pixels>> {
-    const OVERDRAW_VIEWPORTS: f32 = 2.0;
-    let overdraw = layout.viewport_size.height * OVERDRAW_VIEWPORTS;
-    let element_bounds = layout.element_bounds;
-
-    if element_bounds.size.height <= px(0.) {
-        return Some(px(0.)..(layout.viewport_size.height + overdraw).max(px(0.)));
+impl BlockHeights {
+    fn rebuild_offsets(&mut self, from: usize) {
+        self.offsets.resize(self.entries.len() + 1, 0.);
+        for ix in from..self.entries.len() {
+            self.offsets[ix + 1] = self.offsets[ix] + f64::from(self.entries[ix].height);
+        }
     }
+}
 
-    let visible_top = element_bounds.origin.y.max(px(0.));
-    let visible_bottom = element_bounds.bottom().min(layout.viewport_size.height);
-    if visible_bottom <= visible_top {
-        return None;
-    }
-    let top = (visible_top - element_bounds.origin.y - overdraw).max(px(0.));
-    let bottom = visible_bottom - element_bounds.origin.y + overdraw;
-    Some(top..bottom)
+/// Retained block geometry shared by a text state and its current element.
+/// Measurements and prefix offsets have one owner; cloning does not copy them.
+#[derive(Clone, Default)]
+pub(crate) struct BlockHeightCache {
+    inner: Rc<RefCell<BlockHeights>>,
 }
 
 impl BlockHeightCache {
-    /// The number of entries, matching the document's block count when aligned.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.entries.len()
+        self.inner.borrow().entries.len()
     }
 
-    /// How many blocks have a measurement written back. Test-only: it exposes
-    /// how much of the document a frame actually laid out.
     #[cfg(test)]
     pub(crate) fn measured_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|entry| entry.measured.is_some())
-            .count()
+        self.inner.borrow().measured_count
     }
 
-    /// Rebuilds the cache for a document replacement: all blocks start from the
-    /// estimate, because measurements belong to blocks that no longer exist.
-    pub(crate) fn reset(&mut self, count: usize, estimated: Pixels) {
-        self.entries.clear();
-        self.entries.resize(
-            count,
-            BlockHeight {
-                estimated,
-                measured: None,
-            },
-        );
+    pub(crate) fn is_complete(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.measured_count == inner.entries.len()
     }
 
-    /// Aligns the cache length with the document without discarding heights.
-    ///
-    /// This is the render-path safety net for a `windowed` view whose cache has
-    /// not been spliced yet (a late enable, or a parse that arrived before the
-    /// flag was set).
-    pub(crate) fn align(&mut self, count: usize, estimated: Pixels) {
-        match count.cmp(&self.entries.len()) {
-            Ordering::Greater => self.entries.resize(
-                count,
-                BlockHeight {
-                    estimated,
-                    measured: None,
-                },
-            ),
-            Ordering::Less => self.entries.truncate(count),
-            Ordering::Equal => {}
-        }
-    }
-
-    /// Splices the cache after an incremental parse, keeping the measured
-    /// heights of every unchanged block.
-    ///
-    /// `common_prefix` is the number of leading blocks the append left
-    /// untouched. The block the append grew into — old entry `common_prefix`,
-    /// re-parsed in place — keeps its measured height until it repaints:
-    /// dropping it would let the total height, and the scrollbar thumb,
-    /// shrink on every stream tick. Blocks past it are new or reparsed and
-    /// start from the estimate.
-    pub(crate) fn splice(&mut self, common_prefix: usize, new_count: usize, estimated: Pixels) {
-        let tail_measured = self
+    /// Replaces the document and discards its previous measurement identity.
+    pub(crate) fn reset(&self, count: usize, estimated: Pixels) {
+        let mut inner = self.inner.borrow_mut();
+        inner.entries.clear();
+        inner
             .entries
-            .get(common_prefix)
-            .and_then(|entry| entry.measured);
+            .resize(count, BlockHeight::estimated(estimated));
+        inner.measured_count = 0;
+        inner.measurement_epoch = 0;
+        inner.identity = None;
+        inner.rebuild_offsets(0);
+    }
 
-        self.entries.truncate(common_prefix);
-        self.align(new_count, estimated);
+    /// Aligns length without changing the identity or existing measurements.
+    pub(crate) fn align(&self, count: usize, estimated: Pixels) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let old_count = inner.entries.len();
+        if old_count == count {
+            return false;
+        }
 
-        if let Some(measured) = tail_measured
-            && new_count > common_prefix
-            && let Some(entry) = self.entries.get_mut(common_prefix)
+        if count < old_count {
+            let epoch = inner.measurement_epoch;
+            inner.measured_count -= inner.entries[count..]
+                .iter()
+                .filter(|entry| entry.is_measured(epoch))
+                .count();
+        }
+        inner
+            .entries
+            .resize(count, BlockHeight::estimated(estimated));
+        inner.rebuild_offsets(old_count.min(count));
+        true
+    }
+
+    /// Retains only the semantically unchanged prefix after a parse update.
+    /// The first changed block's old height remains an estimate until measured.
+    pub(crate) fn splice(&self, common_prefix: usize, new_count: usize, estimated: Pixels) {
+        let mut inner = self.inner.borrow_mut();
+        let estimated = inner
+            .identity
+            .as_ref()
+            .map_or(estimated, |identity| identity.estimated);
+        let prefix = common_prefix.min(inner.entries.len()).min(new_count);
+        let tail_estimate = inner.entries.get(prefix).map(|entry| entry.height);
+        let epoch = inner.measurement_epoch;
+        inner.measured_count -= inner.entries[prefix..]
+            .iter()
+            .filter(|entry| entry.is_measured(epoch))
+            .count();
+        inner.entries.truncate(prefix);
+        inner
+            .entries
+            .resize(new_count, BlockHeight::estimated(estimated));
+        if let Some(height) = tail_estimate
+            && let Some(entry) = inner.entries.get_mut(prefix)
         {
-            entry.measured = Some(measured);
+            entry.height = height;
         }
+        inner.rebuild_offsets(prefix);
     }
 
-    /// Drops measured heights when the layout inputs they were taken at no
-    /// longer hold, keeping estimates so the total height stays plausible until
-    /// the visible blocks measure again. Returns whether anything was dropped.
-    pub(crate) fn invalidate(&mut self, width_bucket: u16, typography_revision: u64) -> bool {
-        if self.width_bucket == width_bucket && self.typography_revision == typography_revision {
+    /// Establishes the inputs under which measured heights remain valid.
+    /// Returns true for a width, typography, or rich-style change, which also
+    /// refreshes estimates. A renderer-only change retains effective heights
+    /// as provisional estimates and returns false because it may not reflow.
+    pub(crate) fn prepare(
+        &self,
+        count: usize,
+        width: Pixels,
+        typography: &BlockTypography,
+        style: &TextViewStyle,
+        renderer_revision: u64,
+    ) -> bool {
+        let estimated = (typography
+            .text_style
+            .line_height_in_pixels(typography.rem_size)
+            .max(px(1.))
+            + style.paragraph_gap().to_pixels(typography.rem_size))
+        .max(px(0.));
+        let heading_sizes = std::array::from_fn(|ix| style.heading_font_size(ix as u8 + 1));
+        let same_layout = self
+            .inner
+            .borrow()
+            .identity
+            .as_ref()
+            .is_some_and(|previous| {
+                previous.estimated == estimated
+                    && previous.width == width
+                    && previous.typography == *typography
+                    && previous.heading_sizes == heading_sizes
+                    && previous.style == *style
+            });
+        if same_layout {
+            let mut inner = self.inner.borrow_mut();
+            let renderer_changed = inner
+                .identity
+                .as_ref()
+                .is_some_and(|previous| previous.renderer_revision != renderer_revision);
+            if renderer_changed {
+                // Older epochs keep their geometry without remaining measured.
+                inner.measurement_epoch = inner.measurement_epoch.wrapping_add(1);
+                inner.measured_count = 0;
+                if let Some(identity) = &mut inner.identity {
+                    identity.renderer_revision = renderer_revision;
+                }
+            }
+            drop(inner);
+            self.align(count, estimated);
             return false;
         }
-        for entry in &mut self.entries {
-            entry.measured = None;
-        }
-        self.width_bucket = width_bucket;
-        self.typography_revision = typography_revision;
+
+        let mut inner = self.inner.borrow_mut();
+        inner.identity = Some(MeasurementIdentity {
+            estimated,
+            width,
+            typography: typography.clone(),
+            style: style.clone(),
+            heading_sizes,
+            renderer_revision,
+        });
+        inner
+            .entries
+            .resize(count, BlockHeight::estimated(estimated));
+        inner.entries.fill(BlockHeight::estimated(estimated));
+        inner.measured_count = 0;
+        inner.rebuild_offsets(0);
         true
     }
 
-    /// Records a measured height for a painted block. Returns whether the
-    /// height the layout reserves moved by more than [`MEASURE_EPSILON`], so
-    /// the caller can ask for one convergence frame.
-    pub(crate) fn measure(&mut self, ix: usize, height: Pixels) -> bool {
-        let Some(entry) = self.entries.get_mut(ix) else {
-            return false;
-        };
-        if (height - entry.effective()).abs() <= px(MEASURE_EPSILON) {
-            return false;
-        }
-        entry.measured = Some(height);
-        true
+    #[cfg(test)]
+    pub(crate) fn measure(&self, ix: usize, height: Pixels) -> bool {
+        self.measure_many([(ix, height)])
     }
 
-    /// The total height of a contiguous block range.
-    pub(crate) fn sum_range(&self, range: Range<usize>) -> Pixels {
-        let mut total = px(0.);
-        for entry in self.entries.get(range).into_iter().flatten() {
-            total += entry.effective();
-        }
-        total
-    }
+    /// Records one frame's measurements and rebuilds the affected offsets once.
+    /// Newly measured blocks count as a change even when the estimate was exact.
+    pub(crate) fn measure_many(
+        &self,
+        measurements: impl IntoIterator<Item = (usize, Pixels)>,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let epoch = inner.measurement_epoch;
+        let mut first_height_change = inner.entries.len();
+        let mut changed = false;
 
-    /// The inclusive block-index range covering `y` (element-space).
-    ///
-    /// Returns `None` when the cache is empty or `y` reaches neither any
-    /// block's top nor its bottom — an empty range renders only spacers.
-    pub(crate) fn block_range_for_y(&self, y: Range<Pixels>) -> Option<RangeInclusive<usize>> {
-        let mut acc = px(0.);
-        let mut first = None;
-        let mut last = 0;
-        for (ix, entry) in self.entries.iter().enumerate() {
-            let top = acc;
-            acc += entry.effective();
-            if acc <= y.start {
+        for (ix, height) in measurements {
+            let Some(entry) = inner.entries.get_mut(ix) else {
+                continue;
+            };
+            let height = height.max(px(0.));
+            let was_measured = entry.is_measured(epoch);
+            if was_measured && entry.height == height {
                 continue;
             }
-            if top >= y.end {
-                break;
+
+            if entry.height != height {
+                first_height_change = first_height_change.min(ix);
             }
-            if first.is_none() {
-                first = Some(ix);
-            }
-            last = ix;
+            entry.height = height;
+            entry.measured_at = Some(epoch);
+            inner.measured_count += usize::from(!was_measured);
+            changed = true;
         }
-        first.map(|first| first..=last)
+
+        if first_height_change < inner.entries.len() {
+            inner.rebuild_offsets(first_height_change);
+        }
+        changed
     }
 
-    /// The index of the top-level block at element-space `y`.
-    ///
-    /// A `y` past the document resolves to the last block, mirroring how a
-    /// selection endpoint dragged beyond the content pins to its end.
-    pub(crate) fn block_ix_at_y(&self, y: Pixels) -> Option<usize> {
-        if self.entries.is_empty() || y < px(0.) {
+    pub(crate) fn total_height(&self) -> Pixels {
+        self.inner
+            .borrow()
+            .offsets
+            .last()
+            .copied()
+            .map(Pixels::from)
+            .unwrap_or(px(0.))
+    }
+
+    /// Returns a contiguous height sum without walking its blocks.
+    pub(crate) fn sum_range(&self, range: Range<usize>) -> Pixels {
+        let inner = self.inner.borrow();
+        if range.start > range.end {
+            return px(0.);
+        }
+        inner
+            .offsets
+            .get(range.start)
+            .zip(inner.offsets.get(range.end))
+            .map(|(start, end)| Pixels::from(*end - *start))
+            .unwrap_or(px(0.))
+    }
+
+    /// Finds the first block touching a visible range's start. Zero-height
+    /// blocks at that boundary must remain eligible for materialization.
+    pub(crate) fn first_block_for_y(&self, y: Pixels) -> Option<usize> {
+        let inner = self.inner.borrow();
+        if inner.entries.is_empty() || y < px(0.) {
             return None;
         }
-        let mut acc = px(0.);
-        for (ix, entry) in self.entries.iter().enumerate() {
-            acc += entry.effective();
-            if y < acc {
-                return Some(ix);
-            }
+        Some(
+            inner.offsets[1..]
+                .partition_point(|bottom| Pixels::from(*bottom) < y)
+                .min(inner.entries.len() - 1),
+        )
+    }
+
+    /// Resolves a selection endpoint, pinning positions past the document to
+    /// its last block. Negative positions and an empty document have no block.
+    pub(crate) fn block_ix_at_y(&self, y: Pixels) -> Option<usize> {
+        let inner = self.inner.borrow();
+        if inner.entries.is_empty() || y < px(0.) {
+            return None;
         }
-        Some(self.entries.len() - 1)
+        Some(
+            inner.offsets[1..]
+                .partition_point(|bottom| Pixels::from(*bottom) <= y)
+                .min(inner.entries.len() - 1),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use gpui::{FontStyle, FontWeight, rems};
+
     use super::*;
 
     fn cache(count: usize, height: f32) -> BlockHeightCache {
-        let mut cache = BlockHeightCache::default();
+        let cache = BlockHeightCache::default();
         cache.reset(count, px(height));
         cache
     }
 
-    fn measure_all(cache: &mut BlockHeightCache, height: f32) {
-        for ix in 0..cache.len() {
-            cache.measure(ix, px(height));
+    fn styles() -> (TextStyle, TextViewStyle) {
+        (
+            TextStyle {
+                font_size: px(14.).into(),
+                line_height: px(16.).into(),
+                ..Default::default()
+            },
+            TextViewStyle::default().with_paragraph_gap(rems(0.25)),
+        )
+    }
+
+    fn typography(text_style: &TextStyle, rem_size: Pixels) -> BlockTypography {
+        BlockTypography {
+            text_style: text_style.clone(),
+            rem_size,
+            code_font: "monospace".into(),
+            code_font_size: px(13.),
         }
     }
 
     #[test]
-    fn visible_y_range_covers_viewport_with_two_viewports_of_overdraw() {
-        let viewport = gpui::size(px(800.), px(800.));
-
-        // An element filling the viewport from the top: overdraw extends the
-        // range two viewport heights past its bottom, clamped above zero.
-        let at_top = Bounds::new(gpui::point(px(0.), px(0.)), gpui::size(px(400.), px(400.)));
-        assert_eq!(
-            windowed_visible_y_range(WindowedLayout {
-                element_bounds: at_top,
-                viewport_size: viewport
-            }),
-            Some(px(0.)..px(2000.))
-        );
-
-        // An element straddling the viewport top (scrolled past): the range
-        // starts at the element top and overdraws below.
-        let straddling = Bounds::new(
-            gpui::point(px(0.), px(-100.)),
-            gpui::size(px(400.), px(900.)),
-        );
-        assert_eq!(
-            windowed_visible_y_range(WindowedLayout {
-                element_bounds: straddling,
-                viewport_size: viewport
-            }),
-            Some(px(0.)..px(2500.))
-        );
-
-        // An element entering the viewport from below: overdraw reaches up to
-        // its top edge only (clamped at zero).
-        let entering = Bounds::new(
-            gpui::point(px(0.), px(600.)),
-            gpui::size(px(400.), px(900.)),
-        );
-        assert_eq!(
-            windowed_visible_y_range(WindowedLayout {
-                element_bounds: entering,
-                viewport_size: viewport
-            }),
-            Some(px(0.)..px(1800.))
-        );
-    }
-
-    #[test]
-    fn visible_y_range_is_empty_outside_the_viewport() {
-        let viewport = gpui::size(px(800.), px(800.));
-
-        let above = Bounds::new(
-            gpui::point(px(0.), px(-3000.)),
-            gpui::size(px(400.), px(400.)),
-        );
-        assert_eq!(
-            windowed_visible_y_range(WindowedLayout {
-                element_bounds: above,
-                viewport_size: viewport
-            }),
-            None
-        );
-
-        let below = Bounds::new(
-            gpui::point(px(0.), px(1000.)),
-            gpui::size(px(400.), px(400.)),
-        );
-        assert_eq!(
-            windowed_visible_y_range(WindowedLayout {
-                element_bounds: below,
-                viewport_size: viewport
-            }),
-            None
-        );
-    }
-
-    #[test]
-    fn an_unlaid_out_element_assumes_the_window_top() {
-        let viewport = gpui::size(px(800.), px(800.));
-        assert_eq!(
-            windowed_visible_y_range(WindowedLayout {
-                element_bounds: Bounds::<Pixels>::default(),
-                viewport_size: viewport
-            }),
-            Some(px(0.)..px(2400.))
-        );
-    }
-
-    #[test]
-    fn block_range_covers_head_middle_and_tail() {
-        let cache = cache(10, 10.);
-
-        // The first block only.
-        assert_eq!(cache.block_range_for_y(px(0.)..px(10.)), Some(0..=0));
-        // Blocks straddling the middle of the range.
-        assert_eq!(cache.block_range_for_y(px(15.)..px(25.)), Some(1..=2));
-        // Everything up to the last block's bottom.
-        assert_eq!(cache.block_range_for_y(px(0.)..px(100.)), Some(0..=9));
-        // Past the end: nothing.
-        assert_eq!(cache.block_range_for_y(px(500.)..px(600.)), None);
-        // Below the start: nothing.
-        assert_eq!(cache.block_range_for_y(px(-50.)..px(-10.)), None);
-    }
-
-    #[test]
-    fn block_ix_at_y_pins_past_the_end() {
-        let cache = cache(4, 10.);
-
-        assert_eq!(cache.block_ix_at_y(px(0.)), Some(0));
-        assert_eq!(cache.block_ix_at_y(px(35.)), Some(3));
-        // A drag past the document pins to its last block.
-        assert_eq!(cache.block_ix_at_y(px(1000.)), Some(3));
-        // Above the document has no block at all.
-        assert_eq!(cache.block_ix_at_y(px(-1.)), None);
-        assert_eq!(cache.block_ix_at_y(px(0.)), Some(0));
-    }
-
-    #[test]
-    fn invalidate_drops_measured_only_on_a_real_mismatch() {
-        let mut cache = cache(3, 20.);
-        // Establish the measurement identity the heights were taken at.
-        assert!(cache.invalidate(width_bucket(px(640.)), 7));
-        measure_all(&mut cache, 40.);
-
-        // Same width and typography: measurements hold.
-        assert!(!cache.invalidate(width_bucket(px(640.)), 7));
-        assert_eq!(cache.sum_range(0..3), px(120.));
-
-        // A new width bucket clears measurements but keeps estimates.
-        assert!(cache.invalidate(width_bucket(px(832.)), 7));
-        assert_eq!(cache.sum_range(0..3), px(60.));
-
-        // A typography revision change does the same.
-        assert!(cache.invalidate(width_bucket(px(832.)), 8));
-        assert_eq!(cache.sum_range(0..3), px(60.));
-
-        // The stored identity is the quantized bucket, so a resize inside the
-        // same bucket keeps measurements.
-        assert!(!cache.invalidate(width_bucket(px(860.)), 8));
-    }
-
-    #[test]
-    fn measure_writeback_ignores_sub_pixel_jitter() {
-        let mut cache = cache(1, 20.);
-
-        assert!(cache.measure(0, px(40.)));
-        assert!(!cache.measure(0, px(40.2)));
-        assert_eq!(cache.sum_range(0..1), px(40.));
-        // Half a pixel is still jitter.
-        assert!(!cache.measure(0, px(40.5)));
-        assert!(cache.measure(0, px(41.)));
-        assert_eq!(cache.sum_range(0..1), px(41.));
-
-        // Out of range: nothing to write (the document changed under the frame).
+    fn measurements_share_geometry_and_track_exact_estimates() {
+        let cache = cache(3, 20.);
+        let shared = cache.clone();
+        assert!(!cache.is_complete());
+        assert!(shared.measure_many([(0, px(20.)), (1, px(20.)), (2, px(20.))]));
+        assert!(cache.is_complete());
+        assert_eq!(cache.measured_count(), 3);
+        assert_eq!(cache.total_height(), px(60.));
+        assert!(!cache.measure_many([(0, px(20.)), (1, px(20.)), (2, px(20.))]));
+        assert!(cache.measure(1, px(20.25)));
+        assert_eq!(shared.total_height(), px(60.25));
+        assert_eq!(shared.sum_range(2..3), px(20.));
         assert!(!cache.measure(9, px(40.)));
     }
 
     #[test]
-    fn spacers_sum_to_the_total_height() {
-        let mut cache = cache(10, 10.);
-        cache.measure(3, px(25.));
-        cache.measure(7, px(5.));
-        let total = cache.sum_range(0..10);
-        assert_eq!(total, px(8. * 10. + 25. + 5.));
+    fn exact_width_invalidates_measurements_and_same_inputs_preserve_them() {
+        let cache = cache(3, 20.);
+        let (text_style, style) = styles();
+        assert!(cache.prepare(3, px(671.), &typography(&text_style, px(16.)), &style, 0));
+        assert!(cache.measure_many((0..3).map(|ix| (ix, px(40.)))));
+        assert!(!cache.prepare(3, px(671.), &typography(&text_style, px(16.)), &style, 0));
+        assert_eq!(cache.total_height(), px(120.));
+        assert_eq!(cache.measured_count(), 3);
 
-        // Head spacer + visible blocks + tail spacer always rebuilds the total,
-        // whichever range is materialized.
-        let range = cache.block_range_for_y(px(35.)..px(75.)).unwrap();
-        let head = cache.sum_range(0..*range.start());
-        let tail = cache.sum_range(range.end() + 1..10);
-        let visible = range
-            .clone()
-            .fold(px(0.), |acc, ix| acc + cache.sum_range(ix..ix + 1));
-        assert_eq!(head + visible + tail, total);
+        for width in [608., 608.25] {
+            assert!(cache.prepare(3, px(width), &typography(&text_style, px(16.)), &style, 0));
+            assert_eq!(cache.measured_count(), 0);
+            assert_eq!(cache.total_height(), px(60.));
+            cache.measure_many((0..3).map(|ix| (ix, px(40.))));
+        }
     }
 
     #[test]
-    fn streaming_appends_keep_total_height_monotonic_and_preserve_untouched_blocks() {
-        let mut cache = cache(3, 20.);
-        // Blocks 0 and 1 were painted and measured; block 2 is the streaming
-        // tail, measured at a tall code block.
-        cache.measure(0, px(40.));
-        cache.measure(1, px(60.));
-        cache.measure(2, px(200.));
-        let total_before = cache.sum_range(0..3);
+    fn inherited_typography_rem_and_estimates_invalidate_all_blocks() {
+        let cache = cache(3, 20.);
+        let (text_style, style) = styles();
+        let mut current_text_style = text_style.clone();
+        cache.prepare(
+            3,
+            px(640.),
+            &typography(&current_text_style, px(16.)),
+            &style,
+            0,
+        );
 
-        // The append re-parses the tail block and adds 5 more. The common
-        // prefix is everything before the tail.
-        cache.splice(2, 8, px(20.));
+        for (next_text_style, expected_height) in [
+            (
+                TextStyle {
+                    font_size: px(28.).into(),
+                    ..text_style.clone()
+                },
+                px(60.),
+            ),
+            (
+                TextStyle {
+                    line_height: px(40.).into(),
+                    ..text_style.clone()
+                },
+                px(132.),
+            ),
+            (
+                TextStyle {
+                    font_family: "monospace".into(),
+                    ..text_style.clone()
+                },
+                px(60.),
+            ),
+            (
+                TextStyle {
+                    font_weight: FontWeight::BOLD,
+                    font_style: FontStyle::Italic,
+                    ..text_style.clone()
+                },
+                px(60.),
+            ),
+        ] {
+            cache.measure_many((0..3).map(|ix| (ix, px(40.))));
+            assert!(cache.prepare(
+                3,
+                px(640.),
+                &typography(&next_text_style, px(16.)),
+                &style,
+                0
+            ));
+            assert_eq!(cache.measured_count(), 0);
+            assert_eq!(cache.total_height(), expected_height);
+            current_text_style = next_text_style;
+        }
 
-        // Untouched blocks keep their measurements; the tail keeps its last
-        // measured height until it repaints.
-        assert_eq!(cache.sum_range(0..1), px(40.));
-        assert_eq!(cache.sum_range(1..2), px(60.));
+        cache.measure_many((0..3).map(|ix| (ix, px(40.))));
+        assert!(cache.prepare(
+            3,
+            px(640.),
+            &typography(&current_text_style, px(32.)),
+            &style,
+            0
+        ));
+        assert_eq!(cache.measured_count(), 0);
+        assert_eq!(cache.total_height(), px(72.));
+        cache.measure(0, px(60.));
+        let style = style.with_paragraph_gap(rems(1.));
+        assert!(cache.prepare(
+            3,
+            px(640.),
+            &typography(&current_text_style, px(32.)),
+            &style,
+            0
+        ));
+        assert_eq!(cache.total_height(), px(144.));
+    }
+
+    #[test]
+    fn rich_style_reflows_while_renderer_changes_retain_provisional_heights() {
+        let cache = cache(3, 20.);
+        let (text_style, style) = styles();
+        cache.prepare(3, px(640.), &typography(&text_style, px(16.)), &style, 0);
+        cache.measure_many((0..3).map(|ix| (ix, px(40.))));
+
+        let style = style.with_paragraph_gap(rems(0.5));
+        assert!(cache.prepare(3, px(640.), &typography(&text_style, px(16.)), &style, 0));
+        assert_eq!(cache.measured_count(), 0);
+        assert_eq!(cache.total_height(), px(72.));
+        cache.measure_many((0..3).map(|ix| (ix, px(40.))));
+        assert!(!cache.prepare(3, px(640.), &typography(&text_style, px(16.)), &style, 1));
+        assert_eq!(cache.measured_count(), 0);
+        assert_eq!(cache.total_height(), px(120.));
+    }
+
+    #[test]
+    fn code_typography_invalidates_offscreen_measurements() {
+        let cache = cache(3, 20.);
+        let (text_style, style) = styles();
+        let mut typography = typography(&text_style, px(16.));
+        cache.prepare(3, px(640.), &typography, &style, 0);
+        cache.measure_many((0..3).map(|ix| (ix, px(40.))));
+
+        typography.code_font = "another-monospace".into();
+        assert!(cache.prepare(3, px(640.), &typography, &style, 0));
+        assert_eq!(cache.measured_count(), 0);
+        assert_eq!(cache.total_height(), px(60.));
+        cache.measure_many((0..3).map(|ix| (ix, px(40.))));
+
+        typography.code_font_size = px(28.);
+        assert!(cache.prepare(3, px(640.), &typography, &style, 0));
+        assert_eq!(cache.measured_count(), 0);
+        assert_eq!(cache.total_height(), px(60.));
+        assert!(!cache.prepare(3, px(640.), &typography, &style, 0));
+    }
+
+    #[test]
+    fn equivalent_renderer_replacements_keep_frame_results_stable() {
+        let cache = cache(3, 20.);
+        let (text_style, style) = styles();
+        let typography = typography(&text_style, px(16.));
+        cache.prepare(3, px(640.), &typography, &style, 0);
+        cache.measure_many((0..3).map(|ix| (ix, px(40.))));
+
+        for revision in 1..5 {
+            assert!(!cache.prepare(3, px(640.), &typography, &style, revision));
+            assert_eq!(cache.measured_count(), 0);
+            assert!(cache.measure(0, px(40.)));
+            assert_eq!(cache.total_height(), px(120.));
+            assert!(!cache.is_complete());
+        }
+
+        assert!(!cache.prepare(3, px(640.), &typography, &style, 4));
+        assert_eq!(cache.measured_count(), 1);
+        cache.measure_many([(1, px(50.)), (2, px(60.))]);
+        assert!(cache.is_complete());
+        assert_eq!(cache.total_height(), px(150.));
+    }
+
+    #[test]
+    fn stale_measurement_epochs_do_not_leak_into_splice_or_resize_validity() {
+        let cache = cache(4, 20.);
+        let (text_style, style) = styles();
+        let typography = typography(&text_style, px(16.));
+        cache.prepare(4, px(640.), &typography, &style, 0);
+        cache.measure_many((0..4).map(|ix| (ix, px(40.))));
+
+        assert!(!cache.prepare(4, px(640.), &typography, &style, 1));
+        assert_eq!(cache.measured_count(), 0);
+        assert!(cache.align(2, px(20.)));
+        assert_eq!(cache.total_height(), px(80.));
+        assert_eq!(cache.measured_count(), 0);
+        assert!(cache.measure(0, px(40.)));
+        cache.splice(1, 3, px(20.));
+        assert_eq!(cache.measured_count(), 1);
+        assert_eq!(cache.total_height(), px(100.));
+
+        assert!(!cache.prepare(3, px(640.), &typography, &style, 2));
+        assert_eq!(cache.measured_count(), 0);
+        assert_eq!(cache.total_height(), px(100.));
+        cache.measure_many([(0, px(40.)), (1, px(40.)), (2, px(20.))]);
+        assert!(cache.is_complete());
+
+        assert!(!cache.prepare(3, px(640.), &typography, &style, 1));
+        assert_eq!(cache.measured_count(), 0);
+        assert!(cache.measure(0, px(40.)));
+        assert!(!cache.measure(0, px(40.)));
+        assert_eq!(cache.measured_count(), 1);
+    }
+
+    #[test]
+    fn resolved_heading_sizes_are_snapshots_of_the_measurement() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let cache = cache(2, 20.);
+        let (text_style, style) = styles();
+        let scale = Arc::new(AtomicUsize::new(1));
+        let style = style.with_heading_font_size({
+            let scale = scale.clone();
+            move |_, base| base * scale.load(Ordering::Relaxed) as f32
+        });
+        cache.prepare(2, px(640.), &typography(&text_style, px(16.)), &style, 0);
+        cache.measure_many([(0, px(40.)), (1, px(50.))]);
+        scale.store(2, Ordering::Relaxed);
+        assert!(cache.prepare(2, px(640.), &typography(&text_style, px(16.)), &style, 0));
+        assert_eq!(cache.measured_count(), 0);
+        assert_eq!(cache.total_height(), px(40.));
+    }
+
+    #[test]
+    fn splices_retain_only_unchanged_measurements_and_provisional_tail_geometry() {
+        let cache = cache(4, 20.);
+        cache.measure_many([(0, px(40.)), (1, px(60.)), (2, px(200.)), (3, px(80.))]);
+
+        cache.splice(2, 8, px(30.));
+        assert_eq!(cache.measured_count(), 2);
+        assert_eq!(cache.sum_range(0..2), px(100.));
         assert_eq!(cache.sum_range(2..3), px(200.));
-        // New blocks contribute estimates.
-        assert_eq!(cache.sum_range(3..8), px(5. * 20.));
-        assert!(cache.sum_range(0..8) >= total_before);
+        assert_eq!(cache.sum_range(3..8), px(150.));
+        assert!(!cache.is_complete());
+        assert!(cache.measure(2, px(200.)));
+        assert_eq!(cache.measured_count(), 3);
 
-        // Re-measuring the grown tail only moves the total up.
-        assert!(cache.measure(2, px(240.)));
-        assert!(cache.sum_range(0..8) >= total_before);
+        cache.splice(0, 4, px(25.));
+        assert_eq!(cache.measured_count(), 0);
+        assert_eq!(cache.sum_range(0..1), px(40.));
+        assert_eq!(cache.sum_range(1..4), px(75.));
+        cache.measure_many((0..4).map(|ix| (ix, px(25.))));
+        assert!(cache.is_complete());
+
+        cache.splice(2, 2, px(30.));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.measured_count(), 2);
+        assert_eq!(cache.total_height(), px(50.));
+        assert!(cache.is_complete());
     }
 
     #[test]
-    fn a_reparse_that_changes_every_block_keeps_only_the_reparsed_tail_height() {
-        let mut cache = cache(4, 20.);
-        measure_all(&mut cache, 50.);
-
-        // A reparse that changed every block (a mid-stream reference-definition
-        // change forces one): the common prefix is empty, but the first block
-        // is exactly what an append grew into, so its measured height is
-        // retained until it repaints and the other three reset to estimates.
-        cache.splice(0, 4, px(20.));
-        assert_eq!(cache.sum_range(0..1), px(50.));
-        assert_eq!(cache.sum_range(1..4), px(60.));
-
-        // A reparse with no append semantics at all comes through `reset`.
-        cache.reset(4, px(20.));
-        assert_eq!(cache.sum_range(0..4), px(80.));
+    fn appended_estimates_use_the_latest_inherited_layout() {
+        let cache = cache(3, 20.);
+        let (text_style, style) = styles();
+        cache.prepare(3, px(640.), &typography(&text_style, px(48.)), &style, 0);
+        cache.measure_many([(0, px(40.)), (1, px(60.)), (2, px(80.))]);
+        cache.splice(2, 5, DEFAULT_ESTIMATED_BLOCK_HEIGHT);
+        assert_eq!(cache.measured_count(), 2);
+        assert_eq!(cache.sum_range(2..3), px(80.));
+        assert_eq!(cache.sum_range(3..5), px(56.));
+        assert!(!cache.prepare(5, px(640.), &typography(&text_style, px(48.)), &style, 0));
+        assert_eq!(cache.sum_range(2..5), px(136.));
     }
 
     #[test]
-    fn align_extends_with_estimates_and_truncates() {
-        let mut cache = cache(2, 20.);
-        cache.measure(0, px(30.));
+    fn replacement_and_length_changes_keep_offsets_and_validity_aligned() {
+        let cache = cache(3, 20.);
+        let (text_style, style) = styles();
+        cache.prepare(3, px(640.), &typography(&text_style, px(16.)), &style, 0);
+        cache.measure_many([(0, px(40.)), (1, px(60.)), (2, px(80.))]);
 
-        cache.align(4, px(10.));
-        assert_eq!(cache.sum_range(0..1), px(30.));
-        assert_eq!(cache.sum_range(2..4), px(20.));
+        assert!(!cache.prepare(5, px(640.), &typography(&text_style, px(16.)), &style, 0));
+        assert_eq!(cache.measured_count(), 3);
+        assert_eq!(cache.total_height(), px(220.));
+        assert!(cache.align(2, px(20.)));
+        assert_eq!(cache.measured_count(), 2);
+        assert_eq!(cache.total_height(), px(100.));
 
-        cache.align(1, px(10.));
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.sum_range(0..1), px(30.));
+        cache.reset(2, px(30.));
+        assert_eq!(cache.measured_count(), 0);
+        assert_eq!(cache.total_height(), px(60.));
+        assert!(cache.prepare(2, px(640.), &typography(&text_style, px(16.)), &style, 0));
+        assert_eq!(cache.total_height(), px(40.));
+        cache.reset(0, px(20.));
+        assert!(cache.is_complete());
+        assert_eq!(cache.total_height(), px(0.));
+        assert_eq!(cache.block_ix_at_y(px(0.)), None);
     }
 
     #[test]
-    fn reset_rebuilds_everything_from_the_estimate() {
-        let mut cache = cache(2, 20.);
-        measure_all(&mut cache, 50.);
+    fn prefix_search_matches_contiguous_heights_and_half_open_boundaries() {
+        let cache = cache(5, 10.);
+        cache.measure_many([(1, px(25.)), (3, px(0.))]);
+        assert_eq!(cache.total_height(), px(55.));
+        assert_eq!(cache.sum_range(0..0), px(0.));
+        assert_eq!(cache.sum_range(1..4), px(35.));
+        assert_eq!(cache.sum_range(0..9), px(0.));
+        assert_eq!(cache.block_ix_at_y(px(-1.)), None);
+        assert_eq!(cache.block_ix_at_y(px(0.)), Some(0));
+        assert_eq!(cache.block_ix_at_y(px(9.)), Some(0));
+        assert_eq!(cache.block_ix_at_y(px(10.)), Some(1));
+        assert_eq!(cache.block_ix_at_y(px(34.)), Some(1));
+        assert_eq!(cache.block_ix_at_y(px(35.)), Some(2));
+        assert_eq!(cache.block_ix_at_y(px(45.)), Some(4));
+        assert_eq!(cache.block_ix_at_y(px(1000.)), Some(4));
+        assert_eq!(cache.first_block_for_y(px(-1.)), None);
+        assert_eq!(cache.first_block_for_y(px(0.)), Some(0));
+        assert_eq!(cache.first_block_for_y(px(45.)), Some(2));
+        assert_eq!(cache.first_block_for_y(px(1000.)), Some(4));
 
-        cache.reset(3, px(20.));
-        assert_eq!(cache.len(), 3);
-        assert_eq!(cache.sum_range(0..3), px(60.));
+        for first in 0..5 {
+            for end in first + 1..=5 {
+                assert_eq!(
+                    cache.sum_range(0..first)
+                        + cache.sum_range(first..end)
+                        + cache.sum_range(end..5),
+                    cache.total_height()
+                );
+            }
+        }
+
+        cache.reset(3, px(0.));
+        assert_eq!(cache.first_block_for_y(px(0.)), Some(0));
+        assert_eq!(cache.block_ix_at_y(px(0.)), Some(2));
+        cache.reset(0, px(0.));
+        assert_eq!(cache.first_block_for_y(px(0.)), None);
     }
 
     #[test]
-    fn width_bucket_survives_small_resizes() {
-        assert_eq!(width_bucket(px(0.)), 0);
-        assert_eq!(width_bucket(px(1000.)), 16);
-        assert_eq!(width_bucket(px(1023.)), 16);
-        assert_eq!(width_bucket(px(1025.)), 16);
-        assert_eq!(width_bucket(px(1050.)), 16);
-        assert_eq!(width_bucket(px(1080.)), 17);
+    fn long_document_offsets_do_not_accumulate_pixel_rounding() {
+        let count = 100_000;
+        let height = px(12.3);
+        let cache = cache(count, f32::from(height));
+        let expected = Pixels::from(f64::from(height) * count as f64);
+        assert_eq!(cache.total_height(), expected);
+        assert_eq!(cache.sum_range(count - 1..count), height);
+        assert_eq!(
+            cache.block_ix_at_y(cache.sum_range(0..count - 1)),
+            Some(count - 1)
+        );
+
+        cache.measure_many([(0, px(10_000.)), (50_000, px(100_000.))]);
+        let expected = Pixels::from(f64::from(height) * (count - 2) as f64 + 110_000.);
+        assert_eq!(cache.total_height(), expected);
+        assert_eq!(cache.sum_range(count - 1..count), height);
+        assert_eq!(
+            cache.block_ix_at_y(cache.sum_range(0..count - 1)),
+            Some(count - 1)
+        );
     }
 }

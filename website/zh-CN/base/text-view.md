@@ -55,6 +55,25 @@ let article = TextView::html("article", html_source);
 
 `scrollable(true)` 让视图填满容器并垂直滚动；未设置时视图随内容增长。`max_lines(n)` 可把非滚动预览限制在最多 `n` 行正文高度。
 
+## 外层滚动区域中的长文档
+
+长文档需要保留自然高度、由祖先容器负责滚动时，可以启用 `windowed(true)`：
+
+```rust
+TextView::new(&document).windowed(true)
+```
+
+只有当前裁剪视口及有限预绘制区域内的块会进行布局。未访问的块保留估算高度，
+整个文档离屏时也不会折叠。宽度、继承字体样式、rem、富文本样式和内容变化会使
+相关测量失效；选择和复制仍然覆盖未访问的块。
+
+应用可以通过 `TextViewState::block_count()` 决定何时启用此模式。
+`TextViewState::is_layout_complete()` 表示所有窗口化块是否都已有当前布局的测量；
+观察该状态实体即可响应解析和测量变化。重新排版或追加内容后，完整布局可能再次
+变为未完成。非窗口化布局返回 `true`；通过 `TextViewState::is_windowed()` 可以
+区分最近一次布局实际采用的模式，模式变化也会通知观察者。此模式不新增滚动
+所有者，与 `scrollable` 或 `max_lines` 同时设置时会被忽略，默认关闭。
+
 ## 可直接使用的默认样式
 
 所有构造方式都会使用 `TextViewStyle::default()`。默认值已经包含可读的正文、次要文字、链接、选择色、代码背景、边框、标题、段落、行内代码和表格样式。只使用 Base 的项目不需要先定义一套样式才能显示文本。
